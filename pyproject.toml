@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "cleanlab"]
 # Heavy libs: never import at module top level anywhere in nlp/.
 ml = ["sentence-transformers", "transformers", "torch", "cleanlab"]
 colab = ["gspread", "google-auth"]

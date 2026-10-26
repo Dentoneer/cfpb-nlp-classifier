@@ -24,6 +24,8 @@ _BOOL = {"type": "boolean"}
 _STR = {"type": "string"}
 JEB_FIELDS = ["product_ok", "issue_ok", "sub_issue_ok"]
 SUMMARY_FIELDS = ["faithful", "covers_main_issue", "invented_details"]
+JEB_PROMPT_VERSION = "jeb-v1"
+SUMMARY_JUDGE_PROMPT_VERSION = "sj-v1"
 
 
 def _schema(fields: list[str]) -> dict:
@@ -80,6 +82,8 @@ def _run(
     cache: JsonlCache,
     *,
     tag: str,
+    prompt_version: str,
+    inputs: list[str],
     model: str,
     fields: list[str],
     schema: dict,
@@ -88,7 +92,6 @@ def _run(
     limiter: RateLimiter | None,
     sleep: Callable[[float], None],
 ) -> list[dict]:
-    prompt_version = cfg.prompt_version
     limiter = limiter or RateLimiter(cfg.rpm)
 
     def key(cid: str) -> str:
@@ -98,7 +101,18 @@ def _run(
     for _, r in rows.iterrows():
         by_id.setdefault(str(r["complaint_id"]), r)
     ids = list(by_id)
-    queue = [c for c in ids if cache.get(key(c)) is None]
+
+    def seen(cid: str) -> dict:
+        return {f"in_{c}": str(by_id[cid][c]) for c in inputs}
+
+    def fresh(cid: str) -> dict | None:
+        """Cached verdict, only if it was judged on the same labels/summary as now."""
+        rec = cache.get(key(cid))
+        if rec is None or any(rec.get(k) != v for k, v in seen(cid).items()):
+            return None
+        return rec
+
+    queue = [c for c in ids if fresh(c) is None]
 
     def request(batch_ids: list[str]) -> tuple[str, str]:
         parts = [
@@ -111,7 +125,10 @@ def _run(
     def handle(raw: str, batch_ids: list[str]) -> list[str]:
         good, retry = parse_flags(raw, batch_ids, fields)
         for rec in good:
-            cache.put(key(rec["complaint_id"]), {**rec, "model_id": model})
+            cache.put(
+                key(rec["complaint_id"]),
+                {**rec, "model_id": model, **seen(rec["complaint_id"])},
+            )
         return retry
 
     failed = run_queue(
@@ -121,7 +138,7 @@ def _run(
     )  # fmt: skip
     if failed:
         print(f"{len(failed)} row(s) failed {tag} validation after retries; left absent.")
-    return [v for c in ids if (v := cache.get(key(c))) is not None]
+    return [v for c in ids if (v := fresh(c)) is not None]
 
 
 _JEB_SYSTEM = (
@@ -160,7 +177,8 @@ def judge_classifications(
         )
 
     recs = _run(
-        rows, cfg, client, ledger, cache, tag="jeb", model=model, fields=JEB_FIELDS,
+        rows, cfg, client, ledger, cache, tag="jeb", prompt_version=JEB_PROMPT_VERSION,
+        inputs=["product", "issue", "sub_issue"], model=model, fields=JEB_FIELDS,
         schema=JEB_SCHEMA, system=_JEB_SYSTEM, render=render, limiter=limiter, sleep=sleep,
     )  # fmt: skip
     out = []
@@ -204,7 +222,8 @@ def judge_summaries(
         return f"complaint_id: {r['complaint_id']}\nnarrative: {text}\nsummary: {r['summary']}"
 
     recs = _run(
-        rows, cfg, client, ledger, cache, tag="summary_judge", model=model, fields=SUMMARY_FIELDS,
+        rows, cfg, client, ledger, cache, tag="summary_judge",
+        prompt_version=SUMMARY_JUDGE_PROMPT_VERSION, inputs=["summary"], model=model, fields=SUMMARY_FIELDS,
         schema=SUMMARY_SCHEMA, system=_SUMMARY_SYSTEM, render=render, limiter=limiter, sleep=sleep,
     )  # fmt: skip
     return pd.DataFrame(recs, columns=["complaint_id", *SUMMARY_FIELDS])

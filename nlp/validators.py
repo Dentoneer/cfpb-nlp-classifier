@@ -166,11 +166,11 @@ def v_cleanlab(
 
     `train_probs_oof` are out-of-fold TF-IDF probabilities on the train pool (columns follow
     `classes`; see `nlp.classifiers.base.oof_proba`). Per-class confident-learning thresholds
-    come from the train pool; a test label is flagged as an issue when the classifier's
-    probability of it is below its class threshold. issue_probability = 1 - p(label) /
-    threshold (clipped to [0, 1]) for flagged labels, else 0; score = 1 - issue_probability.
-    Verdict = Gemini's path equals the CFPB label OR the label is flagged. `gemini_paths`,
-    `test_labels` and `test_probs` rows are aligned with `test_ids`.
+    come from the train pool. issue_probability of the CFPB label = 0 when the classifier's
+    probability of it is >= its class threshold, else 1 - p(label) / threshold. The score is
+    P(Gemini right): 1 - issue_probability when Gemini's path equals the CFPB label, else
+    issue_probability; verdict = score >= 0.5. Complaints whose CFPB label is not in `classes`
+    get no row. `gemini_paths`, `test_labels` and `test_probs` rows are aligned with `test_ids`.
     """
     from cleanlab.count import get_confident_thresholds
 
@@ -184,19 +184,13 @@ def v_cleanlab(
     valid = np.isfinite(thr) & (thr > 0)
     thr = np.where(valid, thr, thr[valid].mean() if valid.any() else 1.0)
 
-    issue_p, agree = [], []
-    for gp, lab, p in zip(gemini_paths, test_labels, test_probs):
-        agree.append(gp == lab)
+    ids, scores = [], []
+    for cid, gp, lab, p in zip(test_ids, gemini_paths, test_labels, test_probs):
         if lab not in col:
-            issue_p.append(1.0)  # label unseen in train: cannot be confirmed
-            continue
+            continue  # label unseen in train: no cleanlab opinion
         j = col[lab]
-        if p[j] >= thr[j]:
-            issue_p.append(0.0)
-        else:
-            issue_p.append(float(min(1.0, max(0.0, 1.0 - p[j] / thr[j]))))
-    issue = np.array(issue_p)
-    flagged = issue > 0.5
-    verdict = np.array(agree) | flagged
-    return _frame([_rows(test_ids, "cleanlab", "path", verdict, 1.0 - issue)])
-
+        issue = 0.0 if p[j] >= thr[j] else float(min(1.0, max(0.0, 1.0 - p[j] / thr[j])))
+        ids.append(cid)
+        scores.append(1.0 - issue if gp == lab else issue)
+    scores = np.array(scores)
+    return _frame([_rows(ids, "cleanlab", "path", scores >= 0.5, scores)])

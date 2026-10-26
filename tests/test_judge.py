@@ -68,7 +68,7 @@ def test_jeb_results_and_cache(cfg, tmp_path):
     assert g.loc[("c0", "product"), "score"] == 1.0 and g.loc[("c0", "product"), "verdict"]
     assert g.loc[("c1", "issue"), "score"] == 0.0
     assert g.loc[("c0", "path"), "score"] == 0.0  # sub_issue not ok -> path wrong
-    assert cache.get(f"c0|jeb|j|{cfg.prompt_version}") is not None
+    assert cache.get("c0|jeb|j|jeb-v1") is not None
     assert ledger.spent() > 0
     n = len(client.calls)
     judge_classifications(rows(), cfg, client, ledger, cache, limiter=limiter)
@@ -116,6 +116,43 @@ def test_judge_summaries(cfg, tmp_path):
     assert list(out.columns) == ["complaint_id", "faithful", "covers_main_issue", "invented_details"]
     assert len(out) == 3
     assert not out.set_index("complaint_id").loc["c0", "covers_main_issue"]
-    assert cache.get(f"c0|summary_judge|j|{cfg.prompt_version}") is not None
+    assert cache.get("c0|summary_judge|j|sj-v1") is not None
     with pytest.raises(ValueError):
         judge_summaries(rows(), cfg, client, ledger, cache, model="m", limiter=limiter)
+
+
+def test_jeb_relabelled_row_is_rejudged(cfg, tmp_path):
+    client, ledger, cache, limiter = make(tmp_path, jeb_responder)
+    r = rows(3)
+    judge_classifications(r, cfg, client, ledger, cache, limiter=limiter)
+    n = len(client.calls)
+    r2 = r.copy()
+    r2.loc[1, "issue"] = "Other issue"
+    out = judge_classifications(r2, cfg, client, ledger, cache, limiter=limiter)
+    assert len(client.calls) == n + 1
+    assert "c1" in client.calls[-1][2] and "c0" not in client.calls[-1][2]
+    assert len(out) == 12
+
+
+def test_summary_changed_is_rejudged(cfg, tmp_path):
+    def responder(model, system, user, schema, thinking):
+        ids = re.findall(r"complaint_id: (\S+)", user)
+        return LLMResponse(
+            json.dumps(
+                [
+                    {"complaint_id": i, "faithful": True, "covers_main_issue": True,
+                     "invented_details": False}
+                    for i in ids
+                ]
+            ),
+            10,
+            10,
+        )
+
+    client, ledger, cache, limiter = make(tmp_path, responder)
+    r = rows(3)
+    judge_summaries(r, cfg, client, ledger, cache, limiter=limiter)
+    n = len(client.calls)
+    r.loc[2, "summary"] = "new summary"
+    judge_summaries(r, cfg, client, ledger, cache, limiter=limiter)
+    assert len(client.calls) == n + 1

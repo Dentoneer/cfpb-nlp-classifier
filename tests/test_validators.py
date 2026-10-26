@@ -133,10 +133,21 @@ def test_cleanlab():
         ["x", "y", "x", "x"], classes, tp, train_labels, IDS, test_labels, test_probs
     )
     assert set(out.validator) == {"cleanlab"} and set(out.level) == {"path"}
-    assert get(out, "a", "cleanlab", "path").verdict
-    assert get(out, "a", "cleanlab", "path").score > 0.9
-    b = get(out, "b", "cleanlab", "path")
-    assert b.verdict and b.score < 0.2  # label flagged -> Gemini disagreement excused
-    c = get(out, "c", "cleanlab", "path")
-    assert not c.verdict and c.score > 0.5  # label looks right and Gemini differs
-    assert get(out, "d", "cleanlab", "path").verdict
+    a = get(out, "a", "cleanlab", "path")  # agrees, label fine
+    assert a.verdict and a.score > 0.9
+    b = get(out, "b", "cleanlab", "path")  # disagrees, label very likely wrong
+    assert b.verdict and b.score > 0.8
+    c = get(out, "c", "cleanlab", "path")  # disagrees, label fine
+    assert not c.verdict and c.score < 0.5
+    d = get(out, "d", "cleanlab", "path")  # agrees with a likely-wrong label
+    assert not d.verdict and d.score < 0.2
+
+
+def test_cleanlab_skips_unseen_label():
+    classes = ["x", "y"]
+    tp = np.array([[0.9, 0.1]] * 5 + [[0.1, 0.9]] * 5)
+    out = v_cleanlab(
+        ["x", "q"], classes, tp, ["x"] * 5 + ["y"] * 5, ["a", "b"], ["x", "q"],
+        np.array([[0.9, 0.1], [0.5, 0.5]]),
+    )  # fmt: skip
+    assert list(out.complaint_id) == ["a"]
