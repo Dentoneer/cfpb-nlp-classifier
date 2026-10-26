@@ -3,7 +3,7 @@ import inspect
 import pandas as pd
 import pytest
 
-from nlp.review import count_verdicts, is_correct, review_rows, select_hand_check
+from nlp.review import agree_path, count_verdicts, is_correct, review_rows, select_hand_check
 
 WIDE = [
     "complaint_id",
@@ -109,3 +109,34 @@ def test_counting_rules():
     assert list(out.columns) == ["level", "n_correct", "n_error", "n_ambiguous", "n_blank"]
     row = out[out.level == "product"].iloc[0]
     assert (row.n_correct, row.n_error, row.n_ambiguous, row.n_blank) == (2, 2, 1, 1)
+
+
+def test_agree_path_requires_all_three_levels():
+    comp = pd.DataFrame(
+        {
+            "complaint_id": ["a", "b", "c", "d"],
+            "product": ["P"] * 4,
+            "issue": ["I"] * 4,
+            "sub_issue": ["S"] * 4,
+            "narrative": ["t"] * 4,
+        }
+    )
+    pred = pd.DataFrame(
+        {
+            "complaint_id": ["a", "b", "c", "d"],
+            "product": ["P", "P", "P", "Q"],
+            "issue": ["I", "I", "J", "J"],
+            "sub_issue": ["S", "X", "S", "X"],
+            "summary": ["s"] * 4,
+        }
+    )
+    ap = agree_path(pred, comp)
+    assert ap.to_dict() == {"a": True, "b": False, "c": False, "d": False}
+    assert ap.mean() == 0.25
+    sel = select_hand_check(pred, comp, n=4, seed=1)
+    assert dict(zip(sel.complaint_id, sel.stratum)) == {
+        "a": "agree",
+        "b": "disagree",
+        "c": "disagree",
+        "d": "disagree",
+    }

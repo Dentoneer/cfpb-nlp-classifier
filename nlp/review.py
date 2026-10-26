@@ -6,7 +6,7 @@ import pandas as pd
 
 from nlp.schema import VERDICTS
 
-__all__ = ["count_verdicts", "is_correct", "review_rows", "select_hand_check"]
+__all__ = ["agree_path", "count_verdicts", "is_correct", "review_rows", "select_hand_check"]
 
 _LEVELS = ["product", "issue", "sub_issue"]
 _WIDE_COLS = (
@@ -25,6 +25,17 @@ def _joined(gemini: pd.DataFrame, complaints: pd.DataFrame) -> pd.DataFrame:
     return g.drop_duplicates("complaint_id").merge(c, on="complaint_id", how="inner")
 
 
+def agree_path(gemini: pd.DataFrame, complaints: pd.DataFrame) -> pd.Series:
+    """Bool Series indexed by complaint_id: True iff product, issue and sub_issue all match CFPB."""
+    df = _joined(gemini, complaints)
+    same = pd.Series(True, index=df.index)
+    for lv in _LEVELS:
+        same &= df[f"gemini_{lv}"] == df[f"cfpb_{lv}"]
+    same.index = df["complaint_id"]
+    same.name = "agree_path"
+    return same
+
+
 def select_hand_check(
     gemini_test: pd.DataFrame, complaints: pd.DataFrame, n: int = 200, seed: int = 20261026
 ) -> pd.DataFrame:
@@ -34,9 +45,7 @@ def select_hand_check(
     n/2, all of them are taken and the rest filled with agreements.
     """
     df = _joined(gemini_test, complaints).sort_values("complaint_id")
-    same = pd.Series(True, index=df.index)
-    for lv in _LEVELS:
-        same &= df[f"gemini_{lv}"] == df[f"cfpb_{lv}"]
+    same = df["complaint_id"].map(agree_path(gemini_test, complaints))
     agree = df.loc[same, "complaint_id"]
     dis = df.loc[~same, "complaint_id"]
     n_dis = min(len(dis), n - n // 2)
