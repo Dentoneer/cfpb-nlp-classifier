@@ -24,7 +24,11 @@ Design: [docs/superpowers/specs/2026-10-26-cfpb-nlp-classifier-design.md](docs/s
 
 ## How we work
 
-- `main` is protected: all changes go through a pull request, CI must pass, and one approval
-  is required before merging.
-- CI (GitHub Actions) runs lint (`ruff`) and tests (`pytest`) on every pull request.
-- Secrets (Gemini API key, etc.) live in Colab Secrets / GitHub Secrets — never in code.
+- `main` is protected by the `protect-main` ruleset: collaborators work on a branch and open a
+  pull request, which needs one approval from the repo owner before merging. The repo admin can
+  bypass. No force-pushes or branch deletion on `main`.
+- CI (GitHub Actions) runs lint (`ruff`) and tests (`pytest`) on every pull request and every
+  push to `main`.
+- This repo is **public**. Secrets (Gemini API key, etc.) live in Colab Secrets / GitHub
+  Secrets — never in code. GitHub secret scanning with push protection is on and blocks pushes
+  containing keys.
