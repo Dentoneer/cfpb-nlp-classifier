@@ -1,6 +1,7 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from nlp.schema import TAXONOMY_COLS
 from nlp.taxonomy import (
@@ -71,11 +72,28 @@ def _counts(n_months=20, change_back=8):
 
 
 def test_choose_window_stops_at_taxonomy_change():
-    start, end = choose_window(_counts(), months=12)
+    start, end = choose_window(_counts(), date(2026, 8, 31), months=12)
     assert start == date(2026, 1, 1)  # first month with the new issue set (index 12)
     assert end == date(2026, 9, 1)  # exclusive, after last month 2026-08
 
 
 def test_choose_window_full_when_stable():
-    start, end = choose_window(_counts(change_back=0), months=12)
+    start, end = choose_window(_counts(change_back=0), date(2026, 8, 31), months=12)
     assert (start, end) == (date(2025, 9, 1), date(2026, 9, 1))
+
+
+def test_choose_window_drops_partial_final_month():
+    c = _counts(change_back=0)  # full months 2025-01..2026-08
+    partial = pd.DataFrame(
+        [("2026-09", "Credit", "Old issue", 5), ("2026-09", "Rare", "Brand new", 5)],
+        columns=["month", "product", "issue", "n"],
+    )
+    c = pd.concat([c, partial], ignore_index=True)
+    start, end = choose_window(c, date(2026, 9, 6), months=12)
+    assert (start, end) == (date(2025, 9, 1), date(2026, 9, 1))
+
+
+def test_choose_window_no_full_month_raises():
+    c = pd.DataFrame([("2026-07", "A", "b", 3)], columns=["month", "product", "issue", "n"])
+    with pytest.raises(ValueError):
+        choose_window(c, date(2026, 7, 6))

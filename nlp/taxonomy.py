@@ -65,28 +65,37 @@ def taxonomy_prompt_text(taxonomy: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def _differs(a: dict[tuple, float], b: dict[tuple, float], tol: float) -> bool:
-    """True if more than `tol` of either month's volume sits in pairs absent from the other."""
-    for x, y in ((a, b), (b, a)):
-        total = sum(x.values())
-        if total and sum(v for k, v in x.items() if k not in y) / total > tol:
-            return True
-    return False
+def _differs(month: dict[tuple, float], ref: dict[tuple, float], tol: float) -> bool:
+    """True if more than `tol` of this month's volume is in pairs absent from the reference."""
+    total = sum(month.values())
+    return bool(total) and sum(v for k, v in month.items() if k not in ref) / total > tol
 
 
-def choose_window(counts_by_month: pd.DataFrame, months: int = 12) -> tuple[date, date]:
-    """Latest window of up to `months` months with a stable (product, issue) set.
+def choose_window(
+    counts_by_month: pd.DataFrame, data_end: date, months: int = 12
+) -> tuple[date, date]:
+    """Latest window of up to `months` full months with a stable (product, issue) set.
 
-    Walks back from the latest month and stops at the first month whose pair set
-    differs from the latest month's on more than 10% of volume. Returns
-    (start, end) with `end` exclusive (first day after the last included month).
+    If `data_end` is not the last calendar day of the latest month present, that month is
+    partial and is dropped. The reference is the latest FULL month. Walking back from it,
+    each earlier month is compared to the reference (not to its neighbour); the walk stops
+    at the first month whose (product, issue) pairs outside the reference's set carry more
+    than 10% of that month's volume. Returns (start, end) with `end` exclusive (first day
+    after the reference month). The window may be shorter than `months` if the stable
+    stretch is short. Raises ValueError if no full month remains.
     """
-    df = counts_by_month
     by_month = {
         m: {(p, i): float(n) for p, i, n in zip(g["product"], g["issue"], g["n"])}
-        for m, g in df.groupby("month")
+        for m, g in counts_by_month.groupby("month")
     }
     ordered = sorted(by_month)
+    if ordered:
+        y, mo = map(int, ordered[-1].split("-"))
+        month_end = (pd.Timestamp(y, mo, 1) + pd.offsets.MonthEnd(0)).date()
+        if data_end < month_end:
+            ordered.pop()
+    if not ordered:
+        raise ValueError("no full months available to choose a window from")
     ref = by_month[ordered[-1]]
     stable = [ordered[-1]]
     for m in reversed(ordered[:-1]):
