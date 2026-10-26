@@ -31,6 +31,14 @@ class TfidfLR:
         self.C = C
         self.model_id = "tfidf+logreg"
 
+    def fingerprint(self) -> dict:
+        return {
+            "model_id": self.model_id,
+            "max_features": self.max_features,
+            "ngram_range": list(self.ngram_range),
+            "C": self.C,
+        }
+
     def fit(self, texts: list[str], path_ids: list[str]) -> None:
         kw = {"max_features": self.max_features, "ngram_range": self.ngram_range}
         self.vec = TfidfVectorizer(sublinear_tf=True, **kw)

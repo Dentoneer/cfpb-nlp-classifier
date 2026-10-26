@@ -107,7 +107,7 @@ def test_fit_or_load_roundtrip(tmp_path):
     cfg = _cfg(tmp_path)
     df = pd.DataFrame({"complaint_id": range(10), "narrative": TEXTS, "path_id": LABELS})
     clf = fit_or_load(cfg, TfidfLR(), df)
-    assert (tmp_path / "models" / "tfidf_lr" / "model.joblib").exists()
+    assert len(list((tmp_path / "models").glob("tfidf_lr-*/model.joblib"))) == 1
 
     class Boom(TfidfLR):
         def fit(self, *a, **k):
@@ -126,6 +126,45 @@ def test_embed_lr_persists_without_cache(tmp_path):
     loaded = fit_or_load(cfg, EmbedLR("fake"), df)
     _, p = loaded.predict_proba(TEXTS[:1])
     assert np.isclose(p.sum(), 1.0)
+
+
+def test_fit_or_load_refits_when_hyperparameters_change(tmp_path):
+    cfg = _cfg(tmp_path)
+    df = pd.DataFrame({"complaint_id": range(10), "narrative": TEXTS, "path_id": LABELS})
+    fit_or_load(cfg, TfidfLR(C=1.0), df)
+    fit_or_load(cfg, TfidfLR(C=1.0), df)  # same config: reuses
+    assert len(list((tmp_path / "models").glob("tfidf_lr-*"))) == 1
+    fit_or_load(cfg, TfidfLR(C=2.0), df)  # changed: new dir
+    assert len(list((tmp_path / "models").glob("tfidf_lr-*"))) == 2
+    fit_or_load(cfg, EmbedKNN("m1", encoder=FakeEncoder(), cache={}), df)
+    fit_or_load(cfg, EmbedKNN("m2", encoder=FakeEncoder(), cache={}), df)
+    assert len(list((tmp_path / "models").glob("embed_knn-*"))) == 2
+
+
+@pytest.mark.slow
+def test_modernbert_save_load_roundtrip(tmp_path):
+    from nlp.classifiers.modernbert import ModernBertClassifier
+
+    cfg = _cfg(tmp_path)
+    texts, labels = TEXTS[:8], LABELS[:8]  # two classes
+    df = pd.DataFrame({"complaint_id": range(8), "narrative": texts, "path_id": labels})
+    clf = fit_or_load(cfg, ModernBertClassifier(max_len=64, epochs=1, batch_size=4), df)
+    c1, p1 = clf.predict_proba(texts)
+    assert len(c1) == 2 and p1.shape == (8, 2)
+    loaded = fit_or_load(cfg, ModernBertClassifier(max_len=64, epochs=1, batch_size=4), df)
+    c2, p2 = loaded.predict_proba(texts)
+    assert c1 == c2 and np.allclose(p1, p2, atol=1e-4)
+    assert (p1.argmax(axis=1) == p2.argmax(axis=1)).all()
+
+
+@pytest.mark.slow
+def test_modernbert_single_class():
+    from nlp.classifiers.modernbert import ModernBertClassifier
+
+    clf = ModernBertClassifier()
+    clf.fit(["a", "b"], [A, A])
+    classes, p = clf.predict_proba(["x"])
+    assert classes == [A] and np.allclose(p, 1.0)
 
 
 @pytest.mark.slow

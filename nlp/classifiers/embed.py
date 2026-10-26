@@ -85,6 +85,9 @@ class _EmbedBase:
             self.encoder = SentenceTransformerEncoder(self.model_name)
         return embed_texts(self.model_name, texts, self.cache, self.encoder)
 
+    def fingerprint(self) -> dict:
+        return {"model_id": self.model_id, **self._hparams()}
+
     def __getstate__(self):
         state = dict(self.__dict__)
         state["cache"] = None  # never persist embeddings with the model
@@ -99,6 +102,9 @@ class EmbedLR(_EmbedBase):
     def __init__(self, model_name: str, encoder=None, cache=None, C: float = 10.0):
         super().__init__(model_name, encoder, cache)
         self.C = C
+
+    def _hparams(self) -> dict:
+        return {"C": self.C}
 
     def fit(self, texts: list[str], path_ids: list[str]) -> None:
         self.classes_, self.lr = fit_lr(self._embed(texts), list(path_ids), self.C)
@@ -116,6 +122,9 @@ class EmbedKNN(_EmbedBase):
     def __init__(self, model_name: str, k: int = 15, encoder=None, cache=None):
         super().__init__(model_name, encoder, cache)
         self.k = k
+
+    def _hparams(self) -> dict:
+        return {"k": self.k}
 
     def fit(self, texts: list[str], path_ids: list[str]) -> None:
         self.X = self._embed(texts)

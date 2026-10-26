@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +22,8 @@ PATH_SEP = " || "
 
 class PathClassifier(Protocol):
     name: str
+
+    def fingerprint(self) -> dict: ...
 
     def fit(self, texts: list[str], path_ids: list[str]) -> None: ...
 
@@ -119,9 +123,15 @@ def oof_proba(
     return classes, out
 
 
+def model_dir(cfg: Config, clf: PathClassifier) -> Path:
+    """models/<name>-<8 hex of fingerprint>, so changed hyperparameters never reuse a model."""
+    fp = json.dumps(clf.fingerprint(), sort_keys=True, default=str)
+    return Path(cfg.artifacts_dir) / "models" / f"{clf.name}-{hashlib.sha1(fp.encode()).hexdigest()[:8]}"
+
+
 def fit_or_load(cfg: Config, clf: PathClassifier, train_df: pd.DataFrame) -> PathClassifier:
     """Fit on train_df (complaint_id, narrative, path_id) or load a persisted model."""
-    d = Path(cfg.artifacts_dir) / "models" / clf.name
+    d = model_dir(cfg, clf)
     texts, labels = train_df["narrative"].tolist(), train_df["path_id"].tolist()
     if hasattr(clf, "save_pretrained"):
         if (d / "meta.json").exists():
