@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Data and model artifacts never go in git — they live on Drive (Phase 1) / BigQuery (Phase 2)
+data/
+artifacts/
+cache/
+*.parquet
+*.csv.zip
+*.jsonl
+models/
+
+# Secrets
+.env
+*.key
+service-account*.json
+
+# Notebooks / editors
+.ipynb_checkpoints/
+.vscode/
+.idea/
