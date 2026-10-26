@@ -25,6 +25,25 @@ Phase 1 must be built so its code and outputs carry straight into Phase 2 withou
 **Source:** CFPB Consumer Complaint Database (public domain, US government). Use only
 complaints that have a consumer narrative (the free text).
 
+**Update 2026-10-26 (approved by Marco):** the CFPB stopped publishing narratives on
+2026-08-14; the official bulk file and API no longer contain them. Source is therefore the
+Hugging Face mirror `Bob-68/cfpb-consumer-complaints` (Parquet, 16.56M rows, 3.8M with
+narrative, dates to 2026-07-06), read with DuckDB directly from `hf://` so only the needed
+columns/rows are fetched. Phase 2's daily feed is a replay of held-back rows from this snapshot.
+
+**Noise filters (approved by Marco), applied once; a report records rows removed per filter:**
+1. Drop rows with null narrative, Product, or Issue.
+2. Window 2024-01-01 → 2026-07-06 (after CFPB's 2023 category rename; window check still runs).
+3. Mass templates: normalized narrative (lowercase, whitespace collapsed) appearing ≥ 5 times →
+   all copies dropped; appearing 2–4 times → keep one copy (earliest `date_received`, then
+   lowest `complaint_id`).
+4. Low signal: narrative < 200 characters, or > 30% of characters are `X` (redactions).
+5. Inconsistent labels: null Sub-issue on an Issue that has a Sub-issue in ≥ 90% of its rows →
+   drop; null Sub-issue on other Issues → `(none)`.
+6. Rare paths: Product→Issue→Sub-issue paths with < 30 rows after filters 1–5 → drop.
+
+Expected ≈ 0.9–1M clean complaints across 11 Products (~79% credit reporting).
+
 **Category hierarchy (Marco's group / subgroup / detail):**
 `group = Product`, `subgroup = Issue`, `detail = Sub-issue`.
 _My call:_ Sub-product was skipped because it is often blank and describes a product variant,

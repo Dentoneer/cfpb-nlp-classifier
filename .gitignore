@@ -27,3 +27,6 @@ service-account*.json
 .ipynb_checkpoints/
 .vscode/
 .idea/
+
+# SDD workspace
+.superpowers/

@@ -6,14 +6,14 @@
 
 **Architecture:** All logic lives in the installable `nlp/` package (pure functions over pandas DataFrames with fixed column schemas). Every pipeline stage writes Parquet to an artifacts directory (Google Drive in Colab, a temp dir in tests) and is skipped on rerun if its output exists. Gemini calls go through one client wrapper that enforces rate limit, response cache, and spend ledger. A synthetic end-to-end smoke run with a fake Gemini client runs in CI.
 
-**Tech Stack:** Python 3.11, pandas + pyarrow, scikit-learn, sentence-transformers, transformers + torch (ModernBERT), cleanlab, google-genai SDK, gspread (+ google-auth in Colab), pytest, ruff, GitHub Actions.
+**Tech Stack:** Python 3.11, pandas + pyarrow, duckdb, scikit-learn, sentence-transformers, transformers + torch (ModernBERT), cleanlab, google-genai SDK, gspread (+ google-auth in Colab), pytest, ruff, GitHub Actions.
 
 **Spec:** `docs/superpowers/specs/2026-10-26-cfpb-nlp-classifier-design.md`
 
 ## Global Constraints
 
 - Hierarchy: `group = Product`, `subgroup = Issue`, `detail = Sub-issue`; missing Sub-issue → the literal `"(none)"`, a valid value.
-- Only complaints with a non-empty `Consumer complaint narrative`.
+- Source: HF mirror `Bob-68/cfpb-consumer-complaints` via DuckDB; noise filters exactly as spec "Noise filters" (window 2024-01-01→2026-07-06, templates ≥5 copies dropped, <200 chars or >30% X dropped, sub-issue rule at 90%, paths <30 rows dropped).
 - Split targets: train pool ≤ 20,000 (no Gemini); tuning ~200; frozen test ~800 (floor 400); hand-check ~200 drawn from test; self-consistency ~150 drawn from test. Fixed seed `20261026`.
 - Test set never used for prompt tuning.
 - Gemini spend hard cap **$4.00** total for Phase 1, enforced in code from API usage metadata × configured prices; output price includes thinking tokens.
@@ -124,23 +124,26 @@ def test_config_loads_default():
 
 ---
 
-### Task 2: CFPB data download, load, clean
+### Task 2: CFPB data load + noise filters (DuckDB over the Hugging Face mirror)
+
+The official CFPB files no longer carry narratives (removed 2026-08-14). Source = HF mirror `Bob-68/cfpb-consumer-complaints`. Columns (verified): `date_received` (timestamp UTC), `product`, `sub_product`, `issue`, `sub_issue`, `consumer_complaint_narrative`, `company_public_response`, `company`, `state`, `zip_code`, `tags`, `submitted_via`, `date_sent_to_company`, `company_response_to_consumer`, `timely_response`, `complaint_id` (string).
 
 **Files:**
 - Create: `nlp/data.py`
-- Test: `tests/test_data.py`, fixture `tests/fixtures/complaints_small.csv` (≈30 rows, real CSV header)
+- Modify: `pyproject.toml` (add core dep `duckdb`)
+- Test: `tests/test_data.py` (fixture Parquet built inside the test with ~40 hand-made rows exercising every filter)
 
 **Interfaces:**
 - Produces:
-  - `BULK_URL = "https://files.consumerfinance.gov/ccdb/complaints.csv.zip"`
-  - `download_bulk(dest: Path) -> Path` — skip if file exists with matching size (HEAD `Content-Length`); stream to `dest.part` then rename.
-  - `load_narratives(zip_or_csv: Path, start: date, end: date, chunksize: int = 200_000) -> pd.DataFrame` — chunked read with `usecols` = CSV headers `Complaint ID, Date received, Product, Issue, Sub-issue, Consumer complaint narrative, Company, State`; keep rows with non-empty narrative and `start <= date < end`; rename to `complaints` schema; `sub_issue` NaN → `"(none)"`; `complaint_id` as str.
+  - `HF_SOURCE = "hf://datasets/Bob-68/cfpb-consumer-complaints/data/*.parquet"`
+  - `FilterParams` dataclass: `start="2024-01-01"`, `end="2026-07-07"` (exclusive), `template_min_copies=5`, `min_chars=200`, `max_x_frac=0.30`, `sub_issue_required_frac=0.90`, `min_path_rows=30`.
+  - `load_clean(source: str, params: FilterParams) -> tuple[pd.DataFrame, pd.DataFrame]` → (`complaints` schema frame, `filter_report` frame `step, rows_before, rows_removed, rows_after`). One DuckDB query pipeline, steps in this exact order: (1) null narrative/product/issue; (2) date window; (3) normalized text = lower + whitespace-collapsed; group count ≥ `template_min_copies` → drop all, else keep the row with earliest `date_received` then lowest `complaint_id`; (4) `length < min_chars` or X-fraction `> max_x_frac`; (5) per issue, share of rows with non-null sub_issue ≥ `sub_issue_required_frac` → drop that issue's null-sub_issue rows; remaining nulls → `"(none)"`; (6) drop paths with `< min_path_rows`. Report counts each step. Narrative renamed to `narrative`; `date_received` → date.
   - `clean_text(s: str, max_chars: int) -> str` — collapse whitespace, keep `XXXX` redactions, truncate to `max_chars`.
-  - `product_counts_by_month(zip_or_csv) -> pd.DataFrame` — `month, product, issue, n` (used by Task 3 to choose the window).
+  - `product_counts_by_month(source: str, params: FilterParams) -> pd.DataFrame` — `month, product, issue, n` over rows with narrative (Task 3's `choose_window` input).
 
-- [ ] **Step 1: Write failing tests** — `test_load_filters_narrative_and_dates` (fixture: rows without narrative and outside window are dropped; exact expected count), `test_missing_sub_issue_becomes_none_literal`, `test_clean_text_truncates_and_keeps_redactions` (`clean_text("a  XXXX\n\nb"*1000, 50)` has len ≤ 50, contains `"XXXX"`, no double spaces), `test_download_skips_existing` (monkeypatched HEAD; no GET issued).
+- [ ] **Step 1: Write failing tests** — `test_filter_nulls_and_window`, `test_mass_template_dropped_entirely` (5 copies → 0 kept), `test_small_duplicate_keeps_earliest` (3 copies → 1 kept, earliest date), `test_short_and_redacted_dropped` (199 chars dropped, 200 kept; 31% X dropped), `test_null_sub_issue_rules` (issue with 95% sub_issue → null row dropped; issue with 0% → `"(none)"`), `test_rare_paths_dropped` (with `min_path_rows=3` in test params), `test_filter_report_counts_add_up`, `test_clean_text_truncates_and_keeps_redactions` (`clean_text("a  XXXX\n\nb"*1000, 50)` has len ≤ 50, contains `"XXXX"`, no double spaces). Tests pass a local Parquet path as `source`. One `slow` test reads 1 row from `HF_SOURCE`.
 - [ ] **Step 2: Run** `pytest tests/test_data.py -v` — FAIL.
-- [ ] **Step 3: Implement** per interfaces. Before writing the fixture, confirm the real CSV header row by streaming the first line from the bulk zip in a scratch dir; if headers differ from those above, use the real ones and note it in `CLAUDE.md`.
+- [ ] **Step 3: Implement** per interfaces.
 - [ ] **Step 4: Run** — PASS; `ruff check .` clean.
 - [ ] **Step 5: Commit/PR/merge** `feat: CFPB data loading`.
 
@@ -343,7 +346,7 @@ def test_config_loads_default():
 
 Each notebook starts with the same setup cell (from `00_setup`): mount Drive at `/content/drive`, `artifacts_dir = /content/drive/MyDrive/cfpb-nlp-classifier/phase1`, `git clone`/`git pull` the public repo, `pip install -e ".[ml,colab]"`, read `GEMINI_API_KEY` from `google.colab.userdata`, `google.colab.auth.authenticate_user()` + gspread client. Cells only call `nlp.*` functions wrapped in `store.stage`.
 
-- `01`: download → `product_counts_by_month` → `choose_window` (print it) → `load_narratives` → `build_taxonomy` → `publish_taxonomy` (print URL) → `make_splits` → print split sizes and Product distribution.
+- `01`: `product_counts_by_month(HF_SOURCE)` → `choose_window` (print; if it starts later than 2024-01-01 use it as `FilterParams.start`) → `load_clean` (stage `complaints_clean` + `filter_report`, print the report) → `build_taxonomy` → `publish_taxonomy` (print URL) → `make_splits` → print split sizes and Product distribution.
 - `02` (GPU runtime): TF-IDF, EmbedLR, EmbedKNN, ModernBERT fit_or_load → predictions on tuning + test → TF-IDF 5-fold OOF probs for cleanlab.
 - `03`: **model bake-off** — 50 tuning rows × candidates `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` (print accuracy per level and actual $ each; total ≤ ~$0.30); Marco picks → set `classifier_model` in config (commit). **Batch size check** on tuning: 10 vs 25 per request. **Thinking level check**: lowest level that holds tuning accuracy (thinking is billed as output). **Prompt iterations** on tuning (bump `prompt_version` each). Print `estimate_run` for the test set + JEB + self-consistency and the remaining cap **before** the paid test run; then classify test.
 - `04`: JEB on full test, summary judge on 100 test rows, self-consistency (2 extra runs on the 150 subset), non-LLM validators, `select_hand_check` → `write_review_sheet` (print URL). **Stop: Marco reviews.**
