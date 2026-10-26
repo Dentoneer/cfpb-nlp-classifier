@@ -2,7 +2,7 @@
 
 LEVELS = ["product", "issue", "sub_issue", "path"]
 SPLITS = ["train", "tuning", "test"]
-VERDICTS = ["both OK", "Gemini better", "CFPB better", "both wrong", "unclear"]
+VERDICTS = ["model right", "label right", "both OK", "both wrong", "ambiguous"]
 
 COMPLAINTS_COLS = [
     "complaint_id",
