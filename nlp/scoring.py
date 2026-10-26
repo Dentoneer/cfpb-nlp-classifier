@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -16,6 +18,7 @@ GEMINI = "gemini"
 TFIDF = "tfidf"
 GO_PRODUCT_THRESHOLD = 0.85
 GO_ALPHA = 0.05
+MIN_COVERAGE = 0.95
 _LEVELS3 = ["product", "issue", "sub_issue"]
 _COST_KEYS = ["gemini_requests", "usd", "runtime_s"]
 
@@ -52,9 +55,37 @@ def classifier_leaderboard(
         s = set(g["complaint_id"]) & set(truth["complaint_id"])
         common = s if common is None else common & s
     common = common or set()
-    cols = ["classifier", "level", "metric", "value", "ci_low", "ci_high", "mcnemar_p", "n"]
+    n_test = len(ids)
+    per_clf = {
+        name: len(set(g["complaint_id"]) & set(truth["complaint_id"]))
+        for name, g in preds.groupby("classifier")
+    }
+    fewest = min(per_clf.values()) if per_clf else 0
+    limiting = sorted(n for n, c in per_clf.items() if c == fewest)
     if not common:
-        return pd.DataFrame(columns=cols)
+        who = ", ".join(limiting) if limiting else "(no classifiers)"
+        raise ValueError(
+            f"No test complaint_ids are predicted by every classifier; fewest/zero overlap: {who}"
+        )
+    coverage = len(common) / n_test
+    if coverage < MIN_COVERAGE:
+        warnings.warn(
+            f"Only {len(common)} of {n_test} test complaints ({coverage:.0%}) are scored by "
+            f"every classifier; limiting classifier(s): {', '.join(limiting)}",
+            UserWarning,
+            stacklevel=2,
+        )
+    cols = [
+        "classifier",
+        "level",
+        "metric",
+        "value",
+        "ci_low",
+        "ci_high",
+        "mcnemar_p",
+        "n",
+        "coverage",
+    ]
     truth = truth[truth["complaint_id"].isin(common)]
     by_clf = {
         name: g[g["complaint_id"].isin(common)][["complaint_id", *_LEVELS3]]
@@ -71,6 +102,7 @@ def classifier_leaderboard(
         scores.insert(0, "classifier", name)
         scores["mcnemar_p"] = np.nan
         scores["n"] = len(common)
+        scores["coverage"] = coverage
         if name != GEMINI and gem_correct:
             for lv in LEVELS:
                 mine = _correct_at_level(by_clf[name], truth, lv)
@@ -226,6 +258,14 @@ def go_no_go(clf_board: pd.DataFrame, adjusted: pd.DataFrame) -> dict:
         reasons.append(
             f"Adjusted product accuracy is {prod_v:.2f}, below the {GO_PRODUCT_THRESHOLD:.2f} bar."
         )
+    if "coverage" in clf_board and len(clf_board):
+        cov = float(clf_board["coverage"].min())
+        n = int(clf_board["n"].min())
+        if cov < MIN_COVERAGE:
+            reasons.append(
+                f"Only {n} of {round(n / cov)} test complaints were scored by every "
+                f"classifier ({cov:.0%})."
+            )
     if not (clf_board["classifier"] == TFIDF).any():
         reasons.append("No tfidf baseline rows on the classifier leaderboard; cannot compare.")
     elif not (clf_board["classifier"] == GEMINI).any():

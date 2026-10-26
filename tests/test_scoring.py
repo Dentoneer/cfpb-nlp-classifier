@@ -245,8 +245,10 @@ def test_classifier_leaderboard_uses_intersection_of_ids():
     ids = [f"c{i}" for i in range(40)]
     g = _preds("gemini", set(ids), ids)
     t = _preds("tfidf", set(ids[:10]), ids[:20])  # predicted only 20
-    board = classifier_leaderboard(pd.concat([g, t]), _comp(ids), ids)
+    with pytest.warns(UserWarning, match="tfidf"):
+        board = classifier_leaderboard(pd.concat([g, t]), _comp(ids), ids)
     assert (board["n"] == 20).all()
+    assert (board["coverage"] == 0.5).all()
     acc = board[(board.metric == "accuracy") & (board.level == "product")].set_index("classifier")
     assert acc.loc["tfidf", "value"] == pytest.approx(0.5)
     assert acc.loc["gemini", "value"] == pytest.approx(1.0)
@@ -257,3 +259,34 @@ def test_inputs_not_mutated():
     before = copy.deepcopy(b)
     go_no_go(b, _adj())
     pd.testing.assert_frame_equal(b, before)
+
+
+def test_zero_overlap_raises_naming_classifier():
+    ids = [f"c{i}" for i in range(10)]
+    g = _preds("gemini", set(ids), ids[:5])
+    t = _preds("tfidf", set(ids), ids[5:])
+    with pytest.raises(ValueError, match="gemini.*tfidf|tfidf.*gemini"):
+        classifier_leaderboard(pd.concat([g, t]), _comp(ids), ids)
+
+
+def test_full_coverage_no_warning():
+    import warnings
+
+    ids = [f"c{i}" for i in range(20)]
+    g = _preds("gemini", set(ids), ids)
+    t = _preds("tfidf", set(ids[:5]), ids)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        board = classifier_leaderboard(pd.concat([g, t]), _comp(ids), ids)
+    assert (board["coverage"] == 1.0).all()
+
+
+def test_go_no_go_low_coverage_reason():
+    board = _board()
+    board["n"] = 20
+    board["coverage"] = 0.5
+    res = go_no_go(board, _adj(0.9))
+    assert res["go"] is False
+    assert any("Only 20 of 40" in r and "50%" in r for r in res["reasons"])
+    board["coverage"] = 1.0
+    assert go_no_go(board, _adj(0.9))["go"] is True
