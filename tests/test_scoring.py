@@ -290,3 +290,11 @@ def test_go_no_go_low_coverage_reason():
     assert any("Only 20 of 40" in r and "50%" in r for r in res["reasons"])
     board["coverage"] = 1.0
     assert go_no_go(board, _adj(0.9))["go"] is True
+
+
+def test_classifier_with_no_test_predictions_raises():
+    ids = [f"c{i}" for i in range(10)]
+    g = _preds("gemini", set(ids), ids)
+    t = _preds("tfidf", set(), ["train1", "train2"])
+    with pytest.raises(ValueError, match="tfidf=0"):
+        classifier_leaderboard(pd.concat([g, t]), _comp(ids), ids)

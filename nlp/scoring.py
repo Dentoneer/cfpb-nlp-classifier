@@ -51,27 +51,34 @@ def classifier_leaderboard(
     )
     truth = complaints[["complaint_id", *_LEVELS3]].drop_duplicates("complaint_id")
     common: set | None = None
-    for _, g in preds.groupby("classifier"):
+    for name in preds_all["classifier"].unique():
+        g = preds[preds["classifier"] == name]
         s = set(g["complaint_id"]) & set(truth["complaint_id"])
         common = s if common is None else common & s
     common = common or set()
     n_test = len(ids)
+    all_clfs = sorted(preds_all["classifier"].unique())
     per_clf = {
-        name: len(set(g["complaint_id"]) & set(truth["complaint_id"]))
-        for name, g in preds.groupby("classifier")
+        name: len(
+            set(preds.loc[preds["classifier"] == name, "complaint_id"]) & set(truth["complaint_id"])
+        )
+        for name in all_clfs
     }
     fewest = min(per_clf.values()) if per_clf else 0
     limiting = sorted(n for n, c in per_clf.items() if c == fewest)
+    counts = ", ".join(f"{n}={per_clf[n]}" for n in all_clfs)
     if not common:
         who = ", ".join(limiting) if limiting else "(no classifiers)"
         raise ValueError(
-            f"No test complaint_ids are predicted by every classifier; fewest/zero overlap: {who}"
+            "No test complaint_ids are predicted by every classifier; "
+            f"fewest/zero overlap: {who} (test ids per classifier: {counts})"
         )
     coverage = len(common) / n_test
     if coverage < MIN_COVERAGE:
         warnings.warn(
             f"Only {len(common)} of {n_test} test complaints ({coverage:.0%}) are scored by "
-            f"every classifier; limiting classifier(s): {', '.join(limiting)}",
+            f"every classifier; limiting classifier(s): {', '.join(limiting)} "
+            f"(test ids per classifier: {counts})",
             UserWarning,
             stacklevel=2,
         )
@@ -263,7 +270,7 @@ def go_no_go(clf_board: pd.DataFrame, adjusted: pd.DataFrame) -> dict:
         n = int(clf_board["n"].min())
         if cov < MIN_COVERAGE:
             reasons.append(
-                f"Only {n} of {round(n / cov)} test complaints were scored by every "
+                f"Only {n} of {round(n / cov) if cov > 0 else 0} test complaints were scored by every "
                 f"classifier ({cov:.0%})."
             )
     if not (clf_board["classifier"] == TFIDF).any():
