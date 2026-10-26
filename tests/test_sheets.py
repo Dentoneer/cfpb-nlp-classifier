@@ -156,9 +156,9 @@ def test_written_values_are_plain_python_types():
 
     gc = FakeGC()
     w = _wide()
-    w["verdict_product"] = np.array([1, 2], dtype=np.int64)
-    w["gemini_summary"] = np.array([0.5, np.nan])
-    w["summary_ok"] = np.array([True, False])
+    w["verdict_product"] = pd.Series([np.int64(1), np.int64(2)], dtype=object)
+    w["gemini_summary"] = pd.Series([np.float64(0.5), np.float64("nan")], dtype=object)
+    w["summary_ok"] = pd.Series([np.bool_(True), np.bool_(False)], dtype=object)
     url = write_review_sheet(gc, w, "r")
     vals = [v for row in gc.books[url].sheet1.values for v in row]
     assert all(type(v) in (str, int, float, bool) for v in vals)
