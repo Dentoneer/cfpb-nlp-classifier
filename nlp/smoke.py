@@ -15,42 +15,24 @@ import random
 import re
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+from nlp import pipeline as P
 from nlp import store
 from nlp.budget import Ledger, RateLimiter
-from nlp.classifiers.base import fit_or_load, oof_proba, probs_long, to_predictions
 from nlp.classifiers.embed import EmbedKNN, EmbedLR, FakeEncoder
 from nlp.classifiers.tfidf import TfidfLR
 from nlp.config import Config
-from nlp.ensemble import ensemble_learned, ensemble_simple, row_status
-from nlp.llm.classify import run_classification
+from nlp.ensemble import row_status
 from nlp.llm.client import FakeClient, GeminiClient, LLMResponse
-from nlp.llm.judge import judge_classifications, judge_summaries
-from nlp.metrics import inverse_weights
-from nlp.review import agree_path, is_correct, select_hand_check
+from nlp.review import select_hand_check
 from nlp.sampling import make_splits
-from nlp.schema import COMPLAINTS_COLS, HUMAN_REVIEW_COLS, VALIDATOR_RESULTS_COLS, path_id
-from nlp.scoring import (
-    adjusted_accuracy,
-    classifier_leaderboard,
-    go_no_go,
-    validator_leaderboard,
-)
+from nlp.schema import COMPLAINTS_COLS, HUMAN_REVIEW_COLS
 from nlp.taxonomy import build_taxonomy
-from nlp.validators import (
-    v_cleanlab,
-    v_hierarchy,
-    v_label_match,
-    v_second_opinion,
-    v_self_confidence,
-    v_self_consistency,
-)
 
 N_COMPLAINTS = 3000
 SEED = 20261026
-LEVELS3 = ["product", "issue", "sub_issue"]
+LEVELS3 = P.LEVELS3
 PRODUCTS = [
     "Credit reporting", "Debt collection", "Mortgage",
     "Checking account", "Credit card", "Student loan",
@@ -150,7 +132,9 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
     def jeb_one(cid: str, block: str) -> dict:
         r = random.Random(f"{cid}|jeb")
         m = _CHOSEN.search(block)
-        chosen = [g.strip() for g in m.groups()] if m else ["", "", ""]
+        if not m:
+            raise ValueError(f"fake judge could not parse chosen labels: {block!r}")
+        chosen = [g.strip() for g in m.groups()]
         flags = [c == t for c, t in zip(chosen, truth[cid])]
         flags = [f != (r.random() < 0.08) for f in flags]  # judge is right ~92% of the time
         return dict(zip(["complaint_id", "product_ok", "issue_ok", "sub_issue_ok"], [cid, *flags]))
@@ -171,7 +155,7 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
         for b in blocks:
             m = _REQ_ID.search(b)
             if not m:
-                continue
+                continue  # preamble block has no complaint id
             cid = m.group(1)
             if "product_ok" in props:
                 items.append(jeb_one(cid, b))
@@ -179,6 +163,8 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
                 items.append(summary_one(cid))
             else:
                 items.append(classify_one(cid))
+        if not items:
+            raise ValueError(f"fake responder found no complaint ids; prompt drifted: {user!r}")
         return LLMResponse(
             json.dumps(items),
             input_tokens=(len(system) + len(user)) // 4,
@@ -214,16 +200,6 @@ def simulate_human_review(
     return pd.DataFrame(rows, columns=HUMAN_REVIEW_COLS)
 
 
-def _human_labels(human_review: pd.DataFrame) -> pd.DataFrame:
-    """complaint_id, correct: Gemini right at all three levels; ambiguous rows dropped."""
-    out = []
-    for cid, g in human_review.groupby("complaint_id", sort=True):
-        oks = [is_correct(v) for v in g["verdict"]]
-        if None not in oks:
-            out.append((cid, all(oks)))
-    return pd.DataFrame(out, columns=["complaint_id", "correct"])
-
-
 def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
     """Run every stage on synthetic data; resumable. Returns go/no-go plus board shapes."""
     cfg = smoke_config(Path(artifacts_dir))
@@ -239,140 +215,93 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
         return store.stage(cfg, name, fn)
 
     data, truth = synthetic_data()
-    complaints = S("complaints", lambda: data)
-    taxonomy = S("taxonomy", lambda: build_taxonomy(complaints))
-    splits = S("splits", lambda: make_splits(complaints, cfg))
-
-    def rows_of(mask) -> pd.DataFrame:
-        ids = splits.loc[mask, "complaint_id"]
-        return complaints[complaints["complaint_id"].isin(ids)].reset_index(drop=True)
-
-    full = complaints.assign(
-        path_id=[path_id(*t) for t in zip(*(complaints[c] for c in LEVELS3))]
-    )
-    train_df = full[full["complaint_id"].isin(splits.loc[splits.split == "train", "complaint_id"])]
-    test_df = full[full["complaint_id"].isin(splits.loc[splits.split == "test", "complaint_id"])]
-    test_df = test_df.reset_index(drop=True)
+    complaints = S(P.STAGE_COMPLAINTS, lambda: data)
+    taxonomy = S(P.STAGE_TAXONOMY, lambda: build_taxonomy(complaints))
+    splits = S(P.STAGE_SPLITS, lambda: make_splits(complaints, cfg))
+    train_df, test_df = P.train_test_frames(complaints, splits)
     test_ids = test_df["complaint_id"].tolist()
-    sc_rows = rows_of(splits["self_consistency"])
+    sc_rows = P.split_rows(complaints, splits, splits["self_consistency"])
 
-    # --- classic classifiers (fit/predict once, shared by the pred and probs stages) ---
+    # --- classic classifiers (fit once; the pred and probs stages share the result) ---
     encoder = FakeEncoder()
+
+    def tfidf():
+        return TfidfLR(max_features=5000, ngram_range=(1, 1))
+
     makers = {
-        "tfidf": lambda: TfidfLR(max_features=5000, ngram_range=(1, 1)),
+        "tfidf": tfidf,
         "embed_lr": lambda: EmbedLR("fake", encoder=encoder, cache={}),
         "knn": lambda: EmbedKNN("fake", encoder=encoder, cache={}),
     }
     preds: dict[str, pd.DataFrame] = {}
     probs: dict[str, pd.DataFrame] = {}
     for name, make in makers.items():
-        memo: dict = {}
+        memo: list = []
 
-        def compute(make=make, memo=memo):
+        def fitted(name=name, make=make, memo=memo):
             if not memo:
-                clf = fit_or_load(cfg, make(), train_df)
-                memo["model_id"] = clf.model_id
-                memo["classes"], memo["p"] = clf.predict_proba(test_df["narrative"].tolist())
-            return memo
+                memo.append(P.fit_predict_classifier(cfg, make(), train_df, test_df, name))
+            return memo[0]
 
-        preds[name] = S(
-            f"pred_{name}",
-            lambda name=name, compute=compute: to_predictions(
-                name, compute()["model_id"], test_ids, compute()["classes"], compute()["p"]
-            ),
-        )
-        probs[name] = S(
-            f"probs_{name}",
-            lambda compute=compute: probs_long(test_ids, compute()["classes"], compute()["p"]),
-        )
+        preds[name] = S(P.stage_pred(name), lambda fitted=fitted: fitted()[0])
+        probs[name] = S(P.stage_probs(name), lambda fitted=fitted: fitted()[1])
 
     # --- Gemini classification + self-consistency runs ---
-    def gemini(name: str, rows: pd.DataFrame) -> pd.DataFrame:
-        return run_classification(
-            rows, cfg, client, ledger, gem_cache, name, taxonomy=taxonomy, limiter=limiter
-        )
+    def gem_run(name: str, rows: pd.DataFrame) -> pd.DataFrame:
+        return P.run_gemini(cfg, rows, client, ledger, gem_cache, taxonomy, name, limiter)
 
-    gem = S("pred_gemini", lambda: gemini("gemini", test_df))
-    sc2 = S("pred_gemini_sc2", lambda: gemini("gemini_sc2", sc_rows))
-    sc3 = S("pred_gemini_sc3", lambda: gemini("gemini_sc3", sc_rows))
-
-    # --- hand-check selection (test only, from Gemini vs CFPB labels) ---
+    gem = S(P.STAGE_PRED_GEMINI, lambda: gem_run("gemini", test_df))
+    sc2 = S(P.STAGE_PRED_GEMINI_SC2, lambda: gem_run("gemini_sc2", sc_rows))
+    sc3 = S(P.STAGE_PRED_GEMINI_SC3, lambda: gem_run("gemini_sc3", sc_rows))
     selection = S(
-        "hand_check", lambda: select_hand_check(gem, complaints, cfg.hand_check_n, cfg.seed)
+        P.STAGE_HAND_CHECK, lambda: select_hand_check(gem, complaints, cfg.hand_check_n, cfg.seed)
     )
 
     # --- validators ---
-    def judged() -> pd.DataFrame:
-        rows = gem.merge(test_df[["complaint_id", "narrative"]], on="complaint_id")
-        return judge_classifications(rows, cfg, client, ledger, judge_cache, limiter=limiter)
-
-    jeb = S("validator_jeb", judged)
-
-    def summary_judged() -> pd.DataFrame:
-        hc = gem[gem["complaint_id"].isin(selection["complaint_id"])]
-        rows = hc.merge(test_df[["complaint_id", "narrative"]], on="complaint_id")
-        return judge_summaries(rows, cfg, client, ledger, judge_cache, limiter=limiter)
-
-    summary_flags = S("summary_judge", summary_judged)
-
-    def cleanlab_rows() -> pd.DataFrame:
-        classes, oof = oof_proba(
-            lambda: TfidfLR(max_features=5000, ngram_range=(1, 1)),
-            train_df["narrative"].tolist(), train_df["path_id"].tolist(),
-            n_splits=3, seed=cfg.seed,
-        )  # fmt: skip
-        wide = probs["tfidf"].pivot(index="complaint_id", columns="path_id", values="prob")
-        tp = wide.reindex(index=test_ids, columns=classes).fillna(0.0).to_numpy()
-        g = gem.drop_duplicates("complaint_id").set_index("complaint_id").loc[test_ids]
-        return v_cleanlab(
-            [path_id(*t) for t in zip(g["product"], g["issue"], g["sub_issue"])],
-            classes, oof, train_df["path_id"].tolist(),
-            test_ids, test_df["path_id"].tolist(), tp,
-        )  # fmt: skip
-
-    def all_validators() -> pd.DataFrame:
-        parts = [
-            v_label_match(gem, complaints),
-            *(v_second_opinion(gem, probs[n], n) for n in makers),
-            v_self_confidence(gem),
-            v_self_consistency([gem[gem["complaint_id"].isin(sc2["complaint_id"])], sc2, sc3]),
-            v_hierarchy(gem, taxonomy),
-            cleanlab_rows(),
-            jeb,
-        ]
-        return pd.concat(parts, ignore_index=True)[VALIDATOR_RESULTS_COLS]
-
-    vres = S("validator_results", all_validators)
+    jeb = S(
+        P.STAGE_JEB, lambda: P.run_jeb(cfg, gem, test_df, client, ledger, judge_cache, limiter)
+    )
+    summary_flags = S(
+        P.STAGE_SUMMARY_JUDGE,
+        lambda: P.run_summary_judge(
+            cfg, gem, test_df, selection, client, ledger, judge_cache, limiter
+        ),
+    )
+    clean = S(
+        P.STAGE_CLEANLAB,
+        lambda: P.cleanlab_validator(cfg, train_df, test_df, gem, probs["tfidf"], tfidf, 3),
+    )
+    vres = S(
+        P.STAGE_VALIDATORS,
+        lambda: P.build_validator_results(complaints, taxonomy, gem, [sc2, sc3], probs, clean, jeb),
+    )
 
     # --- simulated human verdicts, ensembles, row status ---
-    human = S("human_review", lambda: simulate_human_review(selection, gem, complaints, truth))
-    ens_simple = S("ensemble_simple", lambda: ensemble_simple(vres))
-    ens_learned = S("ensemble_learned", lambda: ensemble_learned(vres, _human_labels(human)))
-    status = S("row_status", lambda: row_status(gem, complaints, ens_learned, cfg=cfg))
+    human = S(
+        P.STAGE_HUMAN_REVIEW, lambda: simulate_human_review(selection, gem, complaints, truth)
+    )
+    ens: list = []
+
+    def ensembles(i: int) -> pd.DataFrame:
+        if not ens:
+            ens.extend(P.run_ensembles(vres, human))
+        return ens[i]
+
+    ens_simple = S(P.STAGE_ENSEMBLE_SIMPLE, lambda: ensembles(0))
+    ens_learned = S(P.STAGE_ENSEMBLE_LEARNED, lambda: ensembles(1))
+    status = S(P.STAGE_ROW_STATUS, lambda: row_status(gem, complaints, ens_learned, cfg=cfg))
 
     # --- leaderboards and decision ---
-    all_preds = pd.concat([gem, *preds.values()], ignore_index=True)
-    clf_board = S("classifier_leaderboard", lambda: classifier_leaderboard(
-        all_preds, complaints, test_ids))  # fmt: skip
-    agree = agree_path(gem, complaints)
-    adjusted = S("adjusted_accuracy", lambda: adjusted_accuracy(
-        human, selection, float(agree.mean()), n_boot=200, seed=cfg.seed))  # fmt: skip
-    strata = pd.Series(
-        np.where(agree.reindex(test_ids).to_numpy(dtype=bool), "agree", "disagree"),
-        index=test_ids,
-    )
-    weights = inverse_weights(strata[selection["complaint_id"]], strata)
-    weights.index = selection["complaint_id"]
-    all_vres = pd.concat(
-        [vres, ens_simple[VALIDATOR_RESULTS_COLS], ens_learned[VALIDATOR_RESULTS_COLS]],
-        ignore_index=True,
-    )
-    val_board = S("validator_leaderboard", lambda: validator_leaderboard(
-        all_vres, human, weights, {}))  # fmt: skip
-    decision = go_no_go(clf_board, adjusted)
-
+    scored = P.run_scoring(
+        cfg, pd.concat([gem, *preds.values()], ignore_index=True), complaints, test_ids, gem,
+        human, selection, P.all_validator_results(vres, ens_simple, ens_learned),
+        n_boot=200, stage=S,
+    )  # fmt: skip
+    clf_board, adjusted = scored["classifier_board"], scored["adjusted"]
+    val_board = scored["validator_board"]
+    jeb_path = val_board[(val_board["validator"] == "jeb") & (val_board["level"] == "path")]
     return {
-        **decision,
+        **scored["decision"],
         "classifiers": sorted(clf_board["classifier"].unique()),
         "n_classifiers": int(clf_board["classifier"].nunique()),
         "n_levels": int(clf_board["level"].nunique()),
@@ -380,7 +309,14 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
         "validator_board_shape": tuple(val_board.shape),
         "n_validators": int(val_board["validator"].nunique()),
         "adjusted": adjusted.set_index("level")["value"].to_dict(),
+        "gemini_path_accuracy": _board_value(clf_board, "gemini", "path", "accuracy"),
+        "jeb_path_catch_rate": float(jeb_path["catch_rate"].iloc[0]),
         "status_counts": status["status"].value_counts().to_dict(),
         "summary_ok_share": float(summary_flags["faithful"].mean()),
         "spend_usd": ledger.spent(),
     }
+
+
+def _board_value(board: pd.DataFrame, clf: str, level: str, metric: str) -> float:
+    sel = board[(board.classifier == clf) & (board.level == level) & (board.metric == metric)]
+    return float(sel["value"].iloc[0])
