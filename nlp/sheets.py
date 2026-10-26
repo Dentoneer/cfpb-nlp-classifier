@@ -31,6 +31,8 @@ def taxonomy_snapshot_hash(taxonomy: pd.DataFrame) -> str:
 
 
 def _cell(v: object) -> object:
+    if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+        v = v.item()
     return "" if v is None or (isinstance(v, float) and pd.isna(v)) else v
 
 
@@ -45,7 +47,7 @@ def publish_taxonomy(gc, taxonomy: pd.DataFrame, title: str = "CFPB taxonomy (ph
 
 
 def read_taxonomy(gc, url: str) -> pd.DataFrame:
-    records = gc.open_by_url(url).sheet1.get_all_records()
+    records = gc.open_by_url(url).sheet1.get_all_records(numericise_ignore=["all"])
     df = pd.DataFrame(records, columns=TAXONOMY_COLS[:3])
     for c in TAXONOMY_COLS[:3]:
         df[c] = df[c].astype(str).str.strip()
@@ -100,14 +102,14 @@ def write_review_sheet(gc, rows: pd.DataFrame, title: str) -> str:
 
 def read_review_sheet(gc, url: str) -> pd.DataFrame:
     """Long `human_review` frame: one row per complaint x level; blank verdicts kept as ''."""
-    records = gc.open_by_url(url).sheet1.get_all_records()
+    records = gc.open_by_url(url).sheet1.get_all_records(numericise_ignore=["all"])
     out = []
     for r in records:
         summary_ok = str(r.get("summary_ok", "")).strip()
         for lv in REVIEW_LEVELS:
             out.append(
                 {
-                    "complaint_id": r["complaint_id"],
+                    "complaint_id": str(r["complaint_id"]).strip(),
                     "level": lv,
                     "verdict": str(r.get(f"verdict_{lv}", "")).strip(),
                     "summary_ok": summary_ok,

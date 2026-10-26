@@ -21,11 +21,16 @@ class FakeWorksheet:
     def update(self, values, range_name=None):
         self.values = [list(r) for r in values]
 
-    def get_all_records(self):
+    def get_all_records(self, numericise_ignore=()):
         if not self.values:
             return []
         head, *body = self.values
-        return [dict(zip(head, r, strict=False)) for r in body]
+        ignore = "all" in numericise_ignore
+
+        def conv(v):
+            return int(v) if not ignore and isinstance(v, str) and v.isdigit() else v
+
+        return [{h: conv(v) for h, v in zip(head, r, strict=False)} for r in body]
 
 
 class FakeSpreadsheet:
@@ -136,3 +141,24 @@ def test_review_sheet_roundtrip_with_fake_gc():
     assert got[("c2", "product")] == ""
     assert got[("c2", "sub_issue")] == "both wrong"
     assert out.loc[out.complaint_id == "c2", "summary_ok"].eq("no").all()
+
+
+def test_review_ids_keep_leading_zeros():
+    gc = FakeGC()
+    w = _wide()
+    w["complaint_id"] = ["0012345", "0000007"]
+    out = read_review_sheet(gc, write_review_sheet(gc, w, "r"))
+    assert set(out["complaint_id"]) == {"0012345", "0000007"}
+
+
+def test_written_values_are_plain_python_types():
+    import numpy as np
+
+    gc = FakeGC()
+    w = _wide()
+    w["verdict_product"] = np.array([1, 2], dtype=np.int64)
+    w["gemini_summary"] = np.array([0.5, np.nan])
+    w["summary_ok"] = np.array([True, False])
+    url = write_review_sheet(gc, w, "r")
+    vals = [v for row in gc.books[url].sheet1.values for v in row]
+    assert all(type(v) in (str, int, float, bool) for v in vals)
