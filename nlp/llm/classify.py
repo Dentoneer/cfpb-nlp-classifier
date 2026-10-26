@@ -158,6 +158,59 @@ def _generate_with_backoff(
             sleep(max(e.retry_after or 0.0, 2.0 * 2**attempt))
 
 
+def run_queue(
+    queue: list[str],
+    *,
+    batch_size: int,
+    client: GeminiClient,
+    ledger: Ledger,
+    limiter: RateLimiter,
+    sleep: Callable[[float], None],
+    model: str,
+    thinking: str,
+    schema: dict,
+    request: Callable[[list[str]], tuple[str, str]],
+    handle: Callable[[str, list[str]], list[str]],
+) -> set[str]:
+    """Shared sequential, spend-safe request loop (classification and judging).
+
+    Per request: reserve -> limiter.wait -> generate(max_output_tokens=est_out) ->
+    ledger.record (estimate if usage is missing) -> `handle` (parses, caches, returns ids to
+    retry). Rows are re-queued up to MAX_RETRIES times; returns the ids that never validated.
+    On budget exhaustion stops early; a daily quota 429 raises DailyQuotaExhausted.
+    """
+    attempts: dict[str, int] = {}
+    failed: set[str] = set()
+    while queue:
+        batch_ids, queue = queue[:batch_size], queue[batch_size:]
+        system, user = request(batch_ids)
+        est = estimate_request_tokens(system, user, len(batch_ids), thinking)
+        try:
+            resp = _generate_with_backoff(
+                client, limiter, sleep, ledger, model, est,
+                (system, user, schema, thinking, est[1]),
+            )  # fmt: skip
+        except BudgetExceeded as e:
+            print(f"Budget cap reached ({e}); {len(batch_ids) + len(queue)} rows remaining.")
+            break
+        except RateLimited as e:
+            if e.daily:  # everything finished so far is already cached
+                raise DailyQuotaExhausted(len(batch_ids) + len(queue)) from e
+            raise
+        # Ledger first: a crash after a paid response must never lose the charge.
+        # No usage metadata after a paid call: record the conservative estimate, never raise.
+        in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
+        out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
+        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
+        for cid in handle(resp.text, batch_ids):
+            attempts[cid] = attempts.get(cid, 0) + 1
+            if attempts[cid] > MAX_RETRIES:
+                failed.add(cid)
+            else:
+                queue.append(cid)
+    return failed
+
+
 def run_classification(
     rows: pd.DataFrame,
     cfg: Config,
@@ -195,32 +248,13 @@ def run_classification(
         for c, n in zip(rows["complaint_id"], rows["narrative"])
     }
     queue = [c for c in dict.fromkeys(ids) if cache.get(key(c)) is None]
-    attempts: dict[str, int] = {}
-    failed: set[str] = set()
 
-    while queue:
-        batch_ids, queue = queue[: cfg.batch_size], queue[cfg.batch_size :]
+    def request(batch_ids: list[str]) -> tuple[str, str]:
         batch = pd.DataFrame({"complaint_id": batch_ids, "narrative": [text[c] for c in batch_ids]})
-        system, user = build_prompt(batch, tax_text, prompt_version)
-        est = estimate_request_tokens(system, user, len(batch_ids), thinking)
-        try:
-            resp = _generate_with_backoff(
-                client, limiter, sleep, ledger, model, est,
-                (system, user, RESPONSE_SCHEMA, thinking, est[1]),
-            )  # fmt: skip
-        except BudgetExceeded as e:
-            print(f"Budget cap reached ({e}); {len(batch_ids) + len(queue)} rows remaining.")
-            break
-        except RateLimited as e:
-            if e.daily:  # everything finished so far is already cached
-                raise DailyQuotaExhausted(len(batch_ids) + len(queue)) from e
-            raise
-        # Ledger first: a crash after a paid response must never lose the charge.
-        # No usage metadata after a paid call: record the conservative estimate, never raise.
-        in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
-        out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
-        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
-        parsed, retry = parse_and_validate(resp.text, batch_ids, taxonomy)
+        return build_prompt(batch, tax_text, prompt_version)
+
+    def handle(raw: str, batch_ids: list[str]) -> list[str]:
+        parsed, retry = parse_and_validate(raw, batch_ids, taxonomy)
         run_ts = pd.Timestamp.now(tz="UTC").isoformat()
         for rec in parsed.to_dict("records"):
             cache.put(
@@ -234,12 +268,13 @@ def run_classification(
                     "run_ts": run_ts,
                 },
             )
-        for cid in retry:
-            attempts[cid] = attempts.get(cid, 0) + 1
-            if attempts[cid] > MAX_RETRIES:
-                failed.add(cid)
-            else:
-                queue.append(cid)
+        return retry
+
+    failed = run_queue(
+        queue, batch_size=cfg.batch_size, client=client, ledger=ledger, limiter=limiter,
+        sleep=sleep, model=model, thinking=thinking, schema=RESPONSE_SCHEMA,
+        request=request, handle=handle,
+    )  # fmt: skip
 
     if failed:
         print(f"{len(failed)} row(s) failed validation after {MAX_RETRIES} retries; left absent.")
