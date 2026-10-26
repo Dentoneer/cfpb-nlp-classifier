@@ -187,7 +187,7 @@ def run_classification(
     tax_hash = taxonomy_snapshot_hash(taxonomy)
 
     def key(cid: str) -> str:
-        return f"{cid}|{model}|{prompt_version}"
+        return f"{cid}|{classifier_name}|{model}|{prompt_version}"
 
     ids = [str(c) for c in rows["complaint_id"]]
     text = {
@@ -206,7 +206,7 @@ def run_classification(
         try:
             resp = _generate_with_backoff(
                 client, limiter, sleep, ledger, model, est,
-                (system, user, RESPONSE_SCHEMA, thinking),
+                (system, user, RESPONSE_SCHEMA, thinking, est[1]),
             )  # fmt: skip
         except BudgetExceeded as e:
             print(f"Budget cap reached ({e}); {len(batch_ids) + len(queue)} rows remaining.")
@@ -216,7 +216,10 @@ def run_classification(
                 raise DailyQuotaExhausted(len(batch_ids) + len(queue)) from e
             raise
         # Ledger first: a crash after a paid response must never lose the charge.
-        ledger.record(model, uuid.uuid4().hex, resp.input_tokens, resp.output_tokens)
+        # No usage metadata after a paid call: record the conservative estimate, never raise.
+        in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
+        out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
+        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
         parsed, retry = parse_and_validate(resp.text, batch_ids, taxonomy)
         run_ts = pd.Timestamp.now(tz="UTC").isoformat()
         for rec in parsed.to_dict("records"):

@@ -245,6 +245,40 @@ def test_spend_recorded_before_cache(tmp_path, cfg, taxonomy):
     assert seen["spent_at_first_put"] > 0
 
 
+def test_classifier_name_is_part_of_cache_key(tmp_path, cfg, taxonomy):
+    client, ledger, cache, limiter = make(tmp_path, good_responder())
+    run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    assert len(client.calls) == 1
+    out = run_classification(
+        rows(3), cfg, client, ledger, cache, classifier_name="sc",
+        taxonomy=taxonomy, limiter=limiter, sleep=lambda s: None,
+    )  # fmt: skip
+    assert len(client.calls) == 2
+    assert (out["classifier"] == "sc").all() and len(out) == 3
+
+
+def test_max_output_tokens_equals_reserve_estimate(tmp_path, cfg, taxonomy):
+    client, ledger, cache, limiter = make(tmp_path, good_responder())
+    run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    _model, system, user, _, thinking, max_out = client.calls[0]
+    assert max_out == estimate_request_tokens(system, user, 3, thinking)[1]
+
+
+def test_missing_usage_records_conservative_estimate(tmp_path, cfg, taxonomy):
+    good = good_responder()
+
+    def responder(model, system, user, schema, thinking):
+        r = good(model, system, user, schema, thinking)
+        return LLMResponse(r.text, None, None, None)
+
+    client, ledger, cache, limiter = make(tmp_path, responder)
+    out = run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    _, system, user, _, thinking, _ = client.calls[0]
+    est = estimate_request_tokens(system, user, 3, thinking)
+    assert len(out) == 3
+    assert ledger.spent() == pytest.approx(ledger.cost("m", *est))
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="needs GEMINI_API_KEY")
 def test_real_gemini_one_batch(tmp_path, tmp_cfg, taxonomy):

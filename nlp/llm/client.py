@@ -10,9 +10,9 @@ from typing import Protocol
 @dataclass
 class LLMResponse:
     text: str
-    input_tokens: int
-    output_tokens: int  # candidates + thinking tokens
-    logprobs: list | None = None
+    input_tokens: int | None  # None -> provider gave no usage; runner records the estimate
+    output_tokens: int | None  # candidates + thinking tokens
+    logprobs: list | None = None  # not requested; always None
 
 
 class RateLimited(Exception):
@@ -26,7 +26,13 @@ class RateLimited(Exception):
 
 class GeminiClient(Protocol):
     def generate(
-        self, model: str, system: str, user: str, response_schema: dict, thinking: str
+        self,
+        model: str,
+        system: str,
+        user: str,
+        response_schema: dict,
+        thinking: str,
+        max_output_tokens: int,
     ) -> LLMResponse: ...
 
 
@@ -38,9 +44,15 @@ class FakeClient:
         self.calls: list[tuple] = []
 
     def generate(
-        self, model: str, system: str, user: str, response_schema: dict, thinking: str
+        self,
+        model: str,
+        system: str,
+        user: str,
+        response_schema: dict,
+        thinking: str,
+        max_output_tokens: int,
     ) -> LLMResponse:
-        self.calls.append((model, system, user, response_schema, thinking))
+        self.calls.append((model, system, user, response_schema, thinking, max_output_tokens))
         return self.responder(model, system, user, response_schema, thinking)
 
 
@@ -71,42 +83,34 @@ class GenAIClient:
         return types.ThinkingConfig(thinking_level=_LEVELS[thinking])
 
     def generate(
-        self, model: str, system: str, user: str, response_schema: dict, thinking: str
+        self,
+        model: str,
+        system: str,
+        user: str,
+        response_schema: dict,
+        thinking: str,
+        max_output_tokens: int,
     ) -> LLMResponse:
         from google.genai import errors, types
 
-        def call(logprobs: bool):
-            cfg = types.GenerateContentConfig(
-                system_instruction=system,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                thinking_config=self._thinking_config(model, thinking),
-                response_logprobs=True if logprobs else None,
-            )
-            return self._client.models.generate_content(model=model, contents=user, config=cfg)
-
+        cfg = types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            thinking_config=self._thinking_config(model, thinking),
+            max_output_tokens=max_output_tokens,
+        )
         try:
-            try:
-                resp = call(True)
-            except errors.ClientError as e:
-                if e.code == 429:
-                    raise
-                resp = call(False)  # API rejected logprobs (or the request) for this model
+            resp = self._client.models.generate_content(model=model, contents=user, config=cfg)
         except errors.ClientError as e:
             if e.code == 429:
                 raise self._rate_limited(e) from e
             raise
         u = resp.usage_metadata
-        out = (u.candidates_token_count or 0) + (u.thoughts_token_count or 0)
-        return LLMResponse(resp.text or "", u.prompt_token_count or 0, out, self._logprobs(resp))
-
-    @staticmethod
-    def _logprobs(resp) -> list | None:
-        try:
-            chosen = resp.candidates[0].logprobs_result.chosen_candidates
-            return [c.log_probability for c in chosen] if chosen else None
-        except (AttributeError, IndexError, TypeError):
-            return None
+        if u is None or u.prompt_token_count is None or u.candidates_token_count is None:
+            return LLMResponse(resp.text or "", None, None)
+        out = u.candidates_token_count + (u.thoughts_token_count or 0)
+        return LLMResponse(resp.text or "", u.prompt_token_count, out)
 
     def _rate_limited(self, e) -> RateLimited:
         text = f"{e.message} {e.details}"
