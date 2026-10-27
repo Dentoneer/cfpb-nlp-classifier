@@ -15,7 +15,8 @@ _Last updated: 2026-10-27_
   (Marco: descriptions only, no examples yet), auto-archive of v1 Drive results (ledger kept),
   and fixes for every first-run failure. Implemented (commits 8b5d193..fa4bfb2, 292 tests, verified
   on Python 3.13 + google-genai 2.12.1). **Spend cap raised to $5.00 (Marco, 2026-10-27).** Independent
-  review in progress; then PR, Marco merges, reruns 00->05. CI now: `test` matrix (3.11, 3.13) +
+  review: "ready with fixes" (v2-only cost projection — test likely ~$2 not $1.2-1.5; Part C
+  compares v2 vs TF-IDF on tuning; don't overwrite Sheet edits; + 8 minors). Fix round running; then PR, Marco merges, reruns 00->05. CI now: `test` matrix (3.11, 3.13) +
   `lint-and-test` gate job (name required by ruleset) — confirm on first PR run.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
