@@ -25,13 +25,15 @@ class Config:
     self_consistency_n: int = 150
     max_chars: int = 6000
     batch_size: int = 10
-    spend_cap_usd: float = 4.00
+    spend_cap_usd: float = 5.00
     prices: dict[str, tuple[float, float]] | None = None
     rpd: int | None = None
     thinking: str = "low"
     embed_model: str = "BAAI/bge-base-en-v1.5"
     likely_correct_threshold: float = 0.6
     jev_model: str = "jev-1.14.0"
+    describe_model: str = "gemini-3.8-flash"
+    data_version: str = "v2"
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -43,7 +45,7 @@ class Config:
         for m, p in raw["prices"].items():
             if not all(math.isfinite(v) and v >= 0 for v in p):
                 raise ValueError(f"price for {m!r} must be finite and >= 0, got {list(p)}")
-        cap = float(raw.get("spend_cap_usd", 4.00))
+        cap = float(raw.get("spend_cap_usd", 5.00))
         if not (math.isfinite(cap) and cap > 0):
             raise ValueError(f"spend_cap_usd must be finite and > 0, got {cap}")
         return cls(**raw)

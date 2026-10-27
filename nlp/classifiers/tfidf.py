@@ -17,7 +17,7 @@ def fit_lr(X, path_ids: list[str], C: float):
     classes = sorted(set(path_ids))
     if len(classes) == 1:
         return classes, None
-    model = LogisticRegression(C=C, max_iter=300)
+    model = LogisticRegression(C=C, max_iter=1000)
     model.fit(X, path_ids)
     return list(model.classes_), model
 

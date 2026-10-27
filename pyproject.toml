@@ -12,7 +12,7 @@ dependencies = [
     "pyarrow",
     "scikit-learn",
     "pyyaml",
-    "google-genai",
+    "google-genai>=2.12",  # Colab ships 2.12.1: never make pip upgrade it (breaks google-auth)
     "scipy",
     "duckdb",
     "httpx",
@@ -22,6 +22,8 @@ dependencies = [
 dev = ["pytest", "ruff", "cleanlab"]
 # Heavy libs: never import at module top level anywhere in nlp/.
 ml = ["sentence-transformers", "transformers", "torch", "cleanlab"]
+# Preinstalled in Colab; the notebooks never install this extra (upgrading Google libraries
+# mid-session broke google-auth on the first run).
 colab = ["gspread", "google-auth"]
 
 [tool.setuptools.packages.find]

@@ -13,9 +13,9 @@ from nlp.classifiers.tfidf import TfidfLR
 from nlp.config import Config
 from nlp.schema import PREDICTIONS_COLS, path_id
 
-A = path_id("Credit reporting", "Incorrect information", "(none)")
+A = path_id("Credit reporting", "Incorrect information", "Wrong address")
 B = path_id("Debt collection", "Not my debt", "Never owed")
-C = path_id("Mortgage", "Payment trouble", "(none)")
+C = path_id("Mortgage", "Payment trouble", "Late fees")
 
 TEXTS = (
     ["wrong account on my credit report error"] * 4
@@ -50,7 +50,7 @@ def test_knn_k_larger_than_class():
 
 def test_classifiers_handle_rare_and_unseen_paths():
     texts = TEXTS + ["unique rare complaint zebra"]
-    labels = LABELS + [path_id("Other", "Rare", "(none)")]
+    labels = LABELS + [path_id("Other", "Rare", "Odd case")]
     unseen = ["totally new text about satellites", ""]
     enc = FakeEncoder()
     for clf in [
@@ -79,7 +79,7 @@ def test_to_predictions_schema():
     df = to_predictions("tfidf_lr", "m1", ["c1", "c2"], [A, B, C], probs)
     assert list(df.columns) == PREDICTIONS_COLS
     assert df.loc[0, "product"] == "Credit reporting"
-    assert df.loc[1, "sub_issue"] == "(none)"
+    assert df.loc[1, "sub_issue"] == "Late fees"
     assert df.loc[1, "issue"] == "Payment trouble"
     assert df["confidence"].tolist() == [0.7, 0.7]
     assert (df["prompt_version"] == "n/a").all()
@@ -95,7 +95,7 @@ def test_probs_long_shape():
 
 
 def test_oof_proba_global_classes_and_rare():
-    rare = path_id("Other", "Rare", "(none)")
+    rare = path_id("Other", "Rare", "Odd case")
     classes, p = oof_proba(TfidfLR, TEXTS + ["zebra complaint"], LABELS + [rare], n_splits=3, seed=1)
     assert classes == sorted(set(LABELS + [rare]))
     assert p.shape == (11, len(classes))

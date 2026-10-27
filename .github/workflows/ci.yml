@@ -6,14 +6,19 @@ on:
     branches: [main]
 
 jobs:
-  lint-and-test:
+  test:
+    name: test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]  # 3.11 = minimum supported; 3.13 = Colab's Python
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install
         run: |
@@ -30,3 +35,13 @@ jobs:
 
       - name: Check notebooks
         run: python -m nlp.tools.check_notebooks notebooks/
+
+  # The protect-main ruleset requires a check named `lint-and-test`; it passes only when every
+  # Python version above passed.
+  lint-and-test:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All Python versions passed
+        run: test "${{ needs.test.result }}" = "success"

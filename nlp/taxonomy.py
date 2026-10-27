@@ -7,28 +7,44 @@ from datetime import date
 
 import pandas as pd
 
-from nlp.schema import TAXONOMY_COLS, path_id
+from nlp.schema import LABEL_SEP, TAXONOMY_COLS, label_of, path_id, split_label
 
 __all__ = [
     "build_taxonomy",
     "choose_window",
+    "label_of",
+    "normalize_label",
     "normalize_path",
     "path_id",
+    "split_label",
     "taxonomy_prompt_text",
 ]
 
+_PIPE_SPACES = re.compile(r"\s*\|\s*")
 _QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'})
 
 
 def build_taxonomy(complaints: pd.DataFrame) -> pd.DataFrame:
-    """Unique (product, issue, sub_issue) paths, sorted, with their path_id."""
+    """Unique (product, issue, sub_issue) paths, sorted, with their path_id and label.
+
+    Raises ValueError if a name contains `|` (the label separator), since the label could then
+    not be split back into its three parts.
+    """
+    for c in ("product", "issue", "sub_issue"):
+        bad = sorted({str(v) for v in complaints[c] if LABEL_SEP in str(v)})
+        if bad:
+            raise ValueError(
+                f"{c} names may not contain '{LABEL_SEP}' (it separates the label parts): {bad[:5]}"
+            )
     t = (
         complaints[["product", "issue", "sub_issue"]]
         .drop_duplicates()
         .sort_values(["product", "issue", "sub_issue"])
         .reset_index(drop=True)
     )
-    t["path_id"] = [path_id(p, i, s) for p, i, s in zip(t["product"], t["issue"], t["sub_issue"])]
+    parts = list(zip(t["product"], t["issue"], t["sub_issue"]))
+    t["path_id"] = [path_id(*x) for x in parts]
+    t["label"] = [label_of(*x) for x in parts]
     return t[TAXONOMY_COLS]
 
 
@@ -50,19 +66,49 @@ def normalize_path(
     return hits[0] if len(hits) == 1 else None
 
 
-def taxonomy_prompt_text(taxonomy: pd.DataFrame) -> str:
-    """Deterministic nested listing: Product, then indented Issues, then Sub-issues."""
-    tree: dict[str, dict[str, set[str]]] = {}
-    for p, i, s in zip(taxonomy["product"], taxonomy["issue"], taxonomy["sub_issue"]):
-        tree.setdefault(p, {}).setdefault(i, set()).add(s)
-    lines: list[str] = []
-    for p in sorted(tree):
-        lines.append(f"Product: {p}")
-        for i in sorted(tree[p]):
-            lines.append(f"  Issue: {i}")
-            for s in sorted(tree[p][i]):
-                lines.append(f"    Sub-issue: {s}")
-    return "\n".join(lines)
+def _norm_label(s: object) -> str:
+    return _PIPE_SPACES.sub(LABEL_SEP, _norm(s))
+
+
+def normalize_label(taxonomy: pd.DataFrame, label: object) -> str | None:
+    """The exact taxonomy label for `label`: exact match, else the one label equal after
+    normalization (quotes, whitespace, case - as in `normalize_path` - and spaces around
+    `|`), else None."""
+    labels = list(taxonomy["label"])
+    text = "" if label is None else str(label)
+    if text in set(labels):
+        return text
+    want = _norm_label(text)
+    if not want:
+        return None
+    hits = list(dict.fromkeys(x for x in labels if _norm_label(x) == want))
+    return hits[0] if len(hits) == 1 else None
+
+
+def _description_map(descriptions) -> dict[str, str]:
+    if isinstance(descriptions, pd.DataFrame):
+        return dict(zip(descriptions["label"].astype(str), descriptions["description"].astype(str)))
+    return {str(k): str(v) for k, v in dict(descriptions).items()}
+
+
+def taxonomy_prompt_text(taxonomy: pd.DataFrame, descriptions) -> str:
+    """Two lines per taxonomy row, sorted by label::
+
+        - label: <label>
+          description: <description>
+
+    The label is the whole rest of its line, so names containing ':' stay unambiguous.
+    `descriptions` is the descriptions table (label, description) or a label -> text mapping;
+    every taxonomy label needs a non-empty description (ValueError otherwise).
+    """
+    desc = _description_map(descriptions)
+    labels = sorted(set(taxonomy["label"]))
+    missing = [x for x in labels if not desc.get(x, "").strip()]
+    if missing:
+        raise ValueError(f"{len(missing)} taxonomy label(s) have no description, e.g. {missing[:3]}")
+    return "\n".join(
+        f"- label: {x}\n  description: {' '.join(desc[x].split())}" for x in labels
+    )
 
 
 def _differs(month: dict[tuple, float], ref: dict[tuple, float], tol: float) -> bool:

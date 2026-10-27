@@ -104,15 +104,21 @@ def test_short_and_redacted_dropped(tmp_path):
     assert sorted(n.count("X") for n in df["narrative"]) == [0, 60]
 
 
-def test_null_sub_issue_rules(tmp_path):
+def test_rows_without_sub_issue_are_dropped(tmp_path):
     rows = [row(issue="Has subs", sub_issue=f"s{k % 2}") for k in range(19)]
-    rows.append(row(issue="Has subs", sub_issue=None))  # 95% non-null -> dropped
+    rows.append(row(issue="Has subs", sub_issue=None))
     rows += [row(issue="No subs", sub_issue=None) for _ in range(3)]
-    df, _ = load_clean(write(tmp_path, rows), PARAMS)
-    assert len(df[df["issue"] == "Has subs"]) == 19
-    assert df["sub_issue"][df["issue"] == "Has subs"].notna().all()
-    assert (df["sub_issue"][df["issue"] == "No subs"] == "(none)").all()
-    assert (df["issue"] == "No subs").sum() == 3
+    rows += [row(issue="Blank subs", sub_issue=s) for s in ("", "   ", "	")]
+    df, rep = load_clean(write(tmp_path, rows), PARAMS)
+    assert len(df) == 19 and set(df["issue"]) == {"Has subs"}
+    assert set(df["sub_issue"]) == {"s0", "s1"}
+    assert "(none)" not in set(df["sub_issue"])
+    step = rep.set_index("step").loc["no_sub_issue"]
+    assert step["rows_removed"] == 7
+
+
+def test_filter_params_has_no_sub_issue_fraction():
+    assert not hasattr(FilterParams(), "sub_issue_required_frac")
 
 
 def test_rare_paths_dropped(tmp_path):
@@ -132,7 +138,7 @@ def test_filter_report_counts_add_up(tmp_path):
     df, rep = load_clean(write(tmp_path, rows), PARAMS)
     assert list(rep.columns) == ["step", "rows_before", "rows_removed", "rows_after"]
     assert list(rep["step"]) == [
-        "nulls", "window", "templates", "low_signal", "sub_issue_consistency", "rare_paths",
+        "nulls", "window", "templates", "low_signal", "no_sub_issue", "rare_paths",
     ]
     assert rep["rows_before"].iloc[0] == len(rows)
     assert (rep["rows_before"] - rep["rows_removed"] == rep["rows_after"]).all()

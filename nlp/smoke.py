@@ -2,7 +2,9 @@
 
 `run_smoke(artifacts_dir)` generates 3,000 synthetic complaints (6 products / 25 issues /
 40 sub-issues, keyword-bearing text) and runs the real pipeline code on them: splits ->
-TF-IDF / embed-LR / kNN -> Gemini classification (+ self-consistency) -> validators (Jev) and summary judge
+TF-IDF / embed-LR / kNN -> category descriptions (one fake Gemini request per product) ->
+Gemini classification with the description listing (+ self-consistency) -> validators (Jev)
+and summary judge
 -> simulated human verdicts -> ensembles -> leaderboards -> go/no-go. Every stage goes through
 `store.stage` and every paid call through the JSONL caches, so a rerun makes zero API calls.
 ModernBERT is skipped. Needs only the `.[dev]` dependencies (no torch).
@@ -26,6 +28,7 @@ from nlp.config import Config
 from nlp.data import clean_text
 from nlp.ensemble import row_status
 from nlp.llm.client import FakeClient, GeminiClient, LLMResponse
+from nlp.llm.describe import run_descriptions
 from nlp.llm.jev import FakeJevClient, JevClient, JevResponse
 from nlp.review import select_hand_check
 from nlp.sampling import make_splits
@@ -40,17 +43,21 @@ PRODUCTS = [
     "Checking account", "Credit card", "Student loan",
 ]  # fmt: skip
 ISSUES_PER_PRODUCT = [5, 4, 4, 4, 4, 4]  # 25 issues
-N_TWO_SUB_ISSUES = 15  # 15 issues x 2 sub-issues + 10 issues x "(none)" = 40 paths
+N_TWO_SUB_ISSUES = 15  # 15 issues x 2 sub-issues + 10 issues x 1 sub-issue = 40 paths
 _REQ_ID = re.compile(r"^complaint_id: (\S+)$", re.MULTILINE)
+_LABEL = re.compile(r"^LABEL: (.+)$", re.MULTILINE)
+_LISTED = re.compile(r"^- label: (.+)\n  description: (.+)$", re.MULTILINE)
 _QUOTED = re.compile(r'"([^"]*)"')
+MODEL = "gemini-3.8-flash"
 
 
 def smoke_config(artifacts_dir: Path) -> Config:
     """Small sizes for 3,000 rows; limiter effectively off; prices for both models."""
     return Config(
-        classifier_model="gemini-2.5-flash",
+        classifier_model=MODEL,
         judge_model="gemini-3.1-flash-lite",
-        prompt_version="smoke-v1",
+        describe_model=MODEL,
+        prompt_version="smoke-v2",
         rpm=6_000_000,
         artifacts_dir=Path(artifacts_dir),
         seed=SEED,
@@ -61,9 +68,9 @@ def smoke_config(artifacts_dir: Path) -> Config:
         hand_check_n=100,
         self_consistency_n=60,
         batch_size=10,
-        spend_cap_usd=4.00,
+        spend_cap_usd=5.00,
         prices={
-            "gemini-2.5-flash": (0.30, 2.50),
+            MODEL: (0.75, 3.75),
             "gemini-3.1-flash-lite": (0.25, 1.50),
             "jev-1.14.0": (0.042, 0.0),
         },
@@ -80,7 +87,7 @@ def synthetic_data() -> tuple[pd.DataFrame, dict[str, tuple[str, str, str]]]:
             subs = (
                 [f"Sub-issue {issue_no}a", f"Sub-issue {issue_no}b"]
                 if issue_no < N_TWO_SUB_ISSUES
-                else ["(none)"]
+                else [f"Sub-issue {issue_no}a"]
             )
             paths += [(PRODUCTS[p], f"Issue {issue_no}", s) for s in subs]
             issue_no += 1
@@ -110,7 +117,11 @@ def synthetic_data() -> tuple[pd.DataFrame, dict[str, tuple[str, str, str]]]:
 
 
 def make_fake_client(error_rate: float = 0.10) -> FakeClient:
-    """FakeClient whose responder plays classifier (90% correct) and summary judge."""
+    """FakeClient whose responder plays describer, classifier (90% correct) and summary judge.
+
+    The classifier only answers with labels it finds in the system prompt's description
+    listing, so a prompt without descriptions fails loudly.
+    """
     _, truth = synthetic_data()
     all_paths = sorted(set(truth.values()))
     seen_count: dict[str, int] = {}  # per-complaint classification count -> varied reruns
@@ -128,7 +139,7 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
             pick = r.choice(same if same and r.random() < 0.5 else other)
             conf = r.uniform(0.3, 0.85)
         return {
-            "complaint_id": cid, "product": pick[0], "issue": pick[1], "sub_issue": pick[2],
+            "complaint_id": cid, "label": "|".join(pick),
             "summary": f"Consumer reports a problem with {pick[0].lower()} ({pick[1]}).",
             "confidence": round(conf, 3),
         }  # fmt: skip
@@ -142,8 +153,23 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
             "invented_details": r.random() < 0.1,
         }
 
+    def describe(user: str) -> list[dict]:
+        labels = _LABEL.findall(user)
+        if not labels:
+            raise ValueError(f"fake describer found no labels; prompt drifted: {user[:200]!r}")
+        return [{"label": x, "description": f"Covers {x.split('|')[2]}. Use when it fits."}
+                for x in labels]  # fmt: skip
+
     def responder(model, system, user, schema, thinking) -> LLMResponse:
         props = schema["items"]["properties"]
+        if "description" in props:
+            items = describe(user)
+            return LLMResponse(json.dumps(items), (len(system) + len(user)) // 4,
+                               40 * len(items) + 100)  # fmt: skip
+        if "label" in props:
+            listed = {m[0] for m in _LISTED.findall(system)}
+            if listed != {"|".join(q) for q in all_paths}:
+                raise ValueError("fake classifier: system prompt lacks the description listing")
         blocks = user.split("\n\n---\n\n")
         items = []
         for b in blocks:
@@ -180,11 +206,7 @@ def make_fake_jev_client() -> FakeJevClient:
         cid = by_text[state]
         nouls = {}
         for qid, q in questions.items():
-            text = q["instructions"]
-            if "no more specific sub-issue" in text:
-                claimed = "(none)"
-            else:
-                claimed = _QUOTED.findall(text)[-1]
+            claimed = _QUOTED.findall(q["instructions"])[-1]
             yes = claimed == truth[cid][index[qid]]
             r = random.Random(f"{cid}|jev|{qid}")
             yes = yes != (r.random() < 0.08)  # judge is wrong ~8% of the time
@@ -246,6 +268,12 @@ def run_smoke(
     train_df, test_df = P.train_test_frames(complaints, splits)
     test_ids = test_df["complaint_id"].tolist()
     sc_rows = P.split_rows(complaints, splits, splits["self_consistency"])
+    descriptions = S(
+        P.STAGE_DESCRIPTIONS,
+        lambda: run_descriptions(
+            complaints, splits, taxonomy, cfg, client, ledger, gem_cache, limiter=limiter
+        ),
+    )
 
     # --- classic classifiers (fit once; the pred and probs stages share the result) ---
     encoder = FakeEncoder()
@@ -343,6 +371,7 @@ def run_smoke(
         "status_counts": status["status"].value_counts().to_dict(),
         "summary_ok_share": float(summary_flags["faithful"].mean()),
         "summary_quality": scored["summary_quality"].set_index("measure")["rate"].to_dict(),
+        "n_descriptions": len(descriptions),
         "spend_usd": ledger.spent(),
     }
 

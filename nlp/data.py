@@ -22,7 +22,6 @@ class FilterParams:
     template_min_copies: int = 5
     min_chars: int = 200
     max_x_frac: float = 0.30
-    sub_issue_required_frac: float = 0.90
     min_path_rows: int = 30
 
 
@@ -40,6 +39,9 @@ def load_clean(
     source: str, params: FilterParams, temp_directory: str | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (complaints frame, filter_report frame) after the six noise filters.
+
+    Every kept complaint has a real sub-issue: rows whose sub-issue is missing or blank are
+    dropped (step `no_sub_issue`), so no placeholder value is ever produced.
 
     Memory-safe for the full 16M-row mirror on a Colab VM: the null and window filters run
     inside the source scan (their report counts come from one aggregate, nothing is copied),
@@ -111,17 +113,10 @@ def _load_clean(
                   / CAST(length(narrative) AS DOUBLE) <= $max_x""",
         ),
         (
-            "sub_issue_consistency",
-            """
-            WITH f AS (
-                SELECT product, issue FROM {prev}
-                GROUP BY product, issue
-                HAVING count(sub_issue) / CAST(count(*) AS DOUBLE) >= $req_frac
-            )
-            SELECT p.complaint_id, p.date_received, p.product, p.issue,
-                   coalesce(p.sub_issue, '(none)') AS sub_issue, p.narrative, p.company, p.state
-            FROM {prev} p LEFT JOIN f USING (product, issue)
-            WHERE NOT (f.issue IS NOT NULL AND p.sub_issue IS NULL)""",
+            "no_sub_issue",
+            r"""
+            SELECT * FROM {prev}
+            WHERE sub_issue IS NOT NULL AND regexp_matches(sub_issue, '\S')""",
         ),
         (
             "rare_paths",
@@ -135,7 +130,6 @@ def _load_clean(
         "copies": params.template_min_copies,
         "min_chars": params.min_chars,
         "max_x": params.max_x_frac,
-        "req_frac": params.sub_issue_required_frac,
         "min_rows": params.min_path_rows,
     }
     prev, before = "s0", kept

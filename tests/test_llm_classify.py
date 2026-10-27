@@ -29,10 +29,15 @@ def taxonomy():
         {
             "product": ["Credit card", "Credit card", "Mortgage"],
             "issue": ["Billing dispute", "Fraud", "Escrow"],
-            "sub_issue": ["(none)", "Stolen card", "Wrong amount"],
+            "sub_issue": ["Late fee", "Stolen card", "Wrong amount"],
         }
     )
     return build_taxonomy(df)
+
+
+def descs(tax):
+    return pd.DataFrame({"label": tax["label"], "description": [f"About {x}." for x in tax["label"]],
+                         "model_id": "dm", "describe_version": "d1"})  # fmt: skip
 
 
 @pytest.fixture
@@ -46,12 +51,10 @@ def rows(n):
     )
 
 
-def item(cid, product="Credit card", issue="Billing dispute", sub="(none)", conf=0.9):
+def item(cid, product="Credit card", issue="Billing dispute", sub="Late fee", conf=0.9):
     return {
         "complaint_id": cid,
-        "product": product,
-        "issue": issue,
-        "sub_issue": sub,
+        "label": f"{product}|{issue}|{sub}",
         "summary": "A short summary.",
         "confidence": conf,
     }
@@ -75,24 +78,41 @@ def make(tmp_path, responder, cap=4.0):
 
 def run(cfg, client, ledger, cache, limiter, taxonomy, n=7, sleep=lambda s: None):
     return run_classification(
-        rows(n), cfg, client, ledger, cache, taxonomy=taxonomy, limiter=limiter, sleep=sleep
-    )
+        rows(n), cfg, client, ledger, cache, taxonomy=taxonomy, descriptions=descs(taxonomy),
+        limiter=limiter, sleep=sleep,
+    )  # fmt: skip
 
 
 def test_parse_normalizes_case_and_whitespace(taxonomy):
-    raw = json.dumps([item("a", "  credit CARD ", "billing   dispute", "(NONE)")])
+    raw = json.dumps([item("a", "  credit CARD", "billing   dispute", "LATE fee ")])
     df, retry = parse_and_validate(raw, ["a"], taxonomy)
     assert retry == []
     r = df.iloc[0]
     assert (r["product"], r["issue"], r["sub_issue"]) == (
         "Credit card",
         "Billing dispute",
-        "(none)",
+        "Late fee",
     )
 
 
+def test_parse_exact_label_is_split_into_levels(taxonomy):
+    raw = json.dumps([{"complaint_id": "a", "label": "Mortgage|Escrow|Wrong amount",
+                       "summary": "s", "confidence": 0.5}])  # fmt: skip
+    df, retry = parse_and_validate(raw, ["a"], taxonomy)
+    assert retry == [] and tuple(df.iloc[0][["product", "issue", "sub_issue"]]) == (
+        "Mortgage", "Escrow", "Wrong amount")
+
+
+@pytest.mark.parametrize("label", ["Mortgage|Escrow", "Mortgage|Escrow|Nope", "", None,
+                                   "Mortgage / Escrow / Wrong amount"])
+def test_parse_invalid_label_is_retried(taxonomy, label):
+    raw = json.dumps([{"complaint_id": "a", "label": label, "summary": "s", "confidence": 0.5}])
+    df, retry = parse_and_validate(raw, ["a"], taxonomy)
+    assert df.empty and retry == ["a"]
+
+
 def test_parse_handles_missing_duplicate_unknown_ids(taxonomy):
-    first = item("a", sub="(none)")
+    first = item("a", sub="Late fee")
     dup = item("a", "Mortgage", "Escrow", "Wrong amount")
     raw = json.dumps([first, dup, item("zzz")])  # b missing, zzz unknown
     df, retry = parse_and_validate(raw, ["a", "b"], taxonomy)
@@ -130,8 +150,10 @@ def test_estimate_request_tokens():
 
 
 def test_build_prompt_contents():
-    system, user = build_prompt(rows(2), "TAXTEXT", "v1")
+    system, user = build_prompt(rows(2), "TAXTEXT", "v2")
     assert "TAXTEXT" in system and "60 words" in system and "exactly one" in system
+    assert "verbatim" in system and "label" in system and "(none)" not in system
+    assert RESPONSE_SCHEMA["items"]["required"] == ["complaint_id", "label", "summary", "confidence"]
     assert "complaint_id: c0" in user and "complaint_id: c1" in user
     assert RESPONSE_SCHEMA["type"] == "array"
 
@@ -141,7 +163,8 @@ def test_every_prediction_has_model_and_prompt_version(tmp_path, cfg, taxonomy):
     out = run(cfg, client, ledger, cache, limiter, taxonomy)
     assert len(out) == 7
     assert set(PREDICTIONS_COLS) <= set(out.columns)
-    assert (out["model_id"] == "m").all() and (out["prompt_version"] == cfg.prompt_version).all()
+    assert (out["model_id"] == "m").all()
+    assert out["prompt_version"].str.fullmatch(cfg.prompt_version + r"\+[0-9a-f]{8}").all()
     assert (out["classifier"] == "gemini").all()
     assert (out["taxonomy_hash"] == taxonomy_snapshot_hash(taxonomy)).all()
     assert out["run_ts"].notna().all()
@@ -254,7 +277,7 @@ def test_classifier_name_is_part_of_cache_key(tmp_path, cfg, taxonomy):
     assert len(client.calls) == 1
     out = run_classification(
         rows(3), cfg, client, ledger, cache, classifier_name="sc",
-        taxonomy=taxonomy, limiter=limiter, sleep=lambda s: None,
+        taxonomy=taxonomy, descriptions=descs(taxonomy), limiter=limiter, sleep=lambda s: None,
     )  # fmt: skip
     assert len(client.calls) == 2
     assert (out["classifier"] == "sc").all() and len(out) == 3
@@ -306,12 +329,66 @@ def test_real_gemini_one_batch(tmp_path, tmp_cfg, taxonomy):
     ledger = Ledger(tmp_path / "l.jsonl", 0.05, cfg.prices)
     cache = JsonlCache(tmp_path / "c.jsonl")
     out = run_classification(
-        r, cfg, GenAIClient(os.environ["GEMINI_API_KEY"]), ledger, cache, taxonomy=taxonomy
+        r, cfg, GenAIClient(os.environ["GEMINI_API_KEY"]), ledger, cache, taxonomy=taxonomy,
+        descriptions=descs(taxonomy),
     )
     assert len(out) == 2
     paths = set(zip(taxonomy["product"], taxonomy["issue"], taxonomy["sub_issue"]))
     for _, x in out.iterrows():
         assert (x["product"], x["issue"], x["sub_issue"]) in paths
+
+
+# ---- v2: descriptions ---------------------------------------------------------------------
+
+
+def test_classification_needs_descriptions(tmp_path, cfg, taxonomy):
+    from nlp.llm.describe import DescriptionsMissing
+
+    client, ledger, cache, limiter = make(tmp_path, good_responder())
+    with pytest.raises(DescriptionsMissing, match=r"Run Part 0 \(descriptions\) in notebook 03 first"):
+        run_classification(rows(2), cfg, client, ledger, cache, taxonomy=taxonomy, limiter=limiter)
+    assert client.calls == [] and ledger.spent() == 0.0
+
+
+def test_classification_reads_saved_descriptions(tmp_path, cfg, taxonomy):
+    from nlp import store
+    from nlp.llm.describe import STAGE_DESCRIPTIONS
+
+    store.write(cfg, STAGE_DESCRIPTIONS, descs(taxonomy))
+    client, ledger, cache, limiter = make(tmp_path, good_responder())
+    out = run_classification(rows(2), cfg, client, ledger, cache, taxonomy=taxonomy,
+                             limiter=limiter, sleep=lambda s: None)  # fmt: skip
+    assert len(out) == 2
+    system = client.calls[0][1]
+    assert "- label: Credit card|Fraud|Stolen card" in system
+    assert "  description: About Credit card|Fraud|Stolen card." in system
+
+
+def test_reserve_grows_with_description_length(tmp_path, cfg, taxonomy):
+    short, long = descs(taxonomy), descs(taxonomy)
+    long["description"] = long["description"] + " word" * 40
+    seen = {}
+    for name, d in (("short", short), ("long", long)):
+        client, ledger, cache, limiter = make(tmp_path / name, good_responder())
+        run_classification(rows(3), cfg, client, ledger, cache, taxonomy=taxonomy,
+                           descriptions=d, limiter=limiter, sleep=lambda s: None)  # fmt: skip
+        _, system, user, _, thinking, _ = client.calls[0]
+        seen[name] = estimate_request_tokens(system, user, 3, thinking)[0]
+        assert seen[name] >= int(len(system) / 4 * 1.5)
+    assert seen["long"] > seen["short"]
+
+
+def test_edited_descriptions_are_not_answered_from_cache(tmp_path, cfg, taxonomy):
+    client, ledger, cache, limiter = make(tmp_path, good_responder())
+    run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    assert len(client.calls) == 1
+    edited = descs(taxonomy)
+    edited.loc[0, "description"] = "Better wording."
+    run_classification(rows(3), cfg, client, ledger, cache, taxonomy=taxonomy,
+                       descriptions=edited, limiter=limiter, sleep=lambda s: None)  # fmt: skip
+    assert len(client.calls) == 2  # new wording -> asked again
+    run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    assert len(client.calls) == 2  # original wording still cached
 
 
 # ---- final review fixes ------------------------------------------------------------------

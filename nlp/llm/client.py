@@ -28,6 +28,18 @@ class ServiceUnavailable(Exception):
     """Provider overloaded (HTTP 5xx) or timed out. Nothing is billed; safe to retry later."""
 
 
+class RequestRejected(Exception):
+    """Google refused the request (HTTP 4xx other than 429). Never billed; retrying won't help.
+
+    `message` is already plain English and says what to do.
+    """
+
+    def __init__(self, status: int | None, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class GeminiClient(Protocol):
     def generate(
         self,
@@ -58,6 +70,31 @@ class FakeClient:
     ) -> LLMResponse:
         self.calls.append((model, system, user, response_schema, thinking, max_output_tokens))
         return self.responder(model, system, user, response_schema, thinking)
+
+
+MAX_OUTPUT_TOKENS = 65536  # output limit of every Gemini model we use; never ask for more
+
+KEY_HELP = "Gemini rejected the API key. See README 'Key problems'."
+
+
+def explain_rejection(e, model: str | None = None, thinking: str | None = None) -> str:
+    """Plain-English reason (and what to do) for a google-genai ClientError other than 429."""
+    code = getattr(e, "code", None)
+    message = str(getattr(e, "message", None) or e)
+    text = f"{message} {getattr(e, 'status', '')} {getattr(e, 'details', '')}".lower()
+    if code == 404 or "no longer available" in text:
+        return (
+            f"Gemini model '{model}' is retired or unknown (Google says: {message[:160]}): model "
+            "retired, remove it from the list."
+        )
+    if "api key" in text or "api_key" in text or code in (401, 403):
+        return KEY_HELP
+    if code == 400 and "thinking" in text:
+        return (
+            f"Model '{model}' does not accept thinking level '{thinking}': this model does not "
+            "support that thinking level. Remove that level from the list (or pick another)."
+        )
+    return f"Google refused the request (HTTP {code}): {message[:300]}"
 
 
 _BUDGETS = {"none": 0, "minimal": 0, "low": 512, "medium": 2048, "high": 8192}
@@ -111,7 +148,7 @@ class GenAIClient:
         except errors.ClientError as e:
             if e.code == 429:
                 raise self._rate_limited(e) from e
-            raise
+            raise RequestRejected(e.code, explain_rejection(e, model, thinking)) from e
         except errors.ServerError as e:  # 5xx, e.g. 503 "model is overloaded": not billed
             raise ServiceUnavailable(f"Gemini HTTP {e.code}: {e.message}") from e
         except httpx.TimeoutException as e:

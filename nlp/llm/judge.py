@@ -12,10 +12,10 @@ from collections.abc import Callable
 
 import pandas as pd
 
-from nlp.budget import Ledger, RateLimiter
+from nlp.budget import Ledger, RateLimiter, estimate_run
 from nlp.config import Config
 from nlp.data import clean_text
-from nlp.llm.classify import run_queue
+from nlp.llm.classify import estimate_request_tokens, run_queue
 from nlp.llm.client import GeminiClient
 from nlp.store import JsonlCache
 
@@ -130,7 +130,7 @@ def _run(
     failed = run_queue(
         queue, batch_size=cfg.batch_size, client=client, ledger=ledger, limiter=limiter,
         sleep=sleep, model=model, thinking=cfg.thinking, schema=schema,
-        request=request, handle=handle,
+        request=request, handle=handle, tag=f"{tag}:{prompt_version}",
     )  # fmt: skip
     if failed:
         print(f"{len(failed)} row(s) failed {tag} validation after retries; left absent.")
@@ -161,12 +161,37 @@ def judge_summaries(
     """`rows` = complaint_id, narrative, summary -> complaint_id, faithful, ... (bools)."""
     model = _check_model(cfg, model)
 
-    def render(r: pd.Series, text: str) -> str:
-        return f"complaint_id: {r['complaint_id']}\nnarrative: {text}\nsummary: {r['summary']}"
-
     recs = _run(
         rows, cfg, client, ledger, cache, tag="summary_judge",
         prompt_version=SUMMARY_JUDGE_PROMPT_VERSION, inputs=["summary"], model=model, fields=SUMMARY_FIELDS,
-        schema=SUMMARY_SCHEMA, system=_SUMMARY_SYSTEM, render=render, limiter=limiter, sleep=sleep,
+        schema=SUMMARY_SCHEMA, system=_SUMMARY_SYSTEM, render=_summary_render, limiter=limiter,
+        sleep=sleep,
     )  # fmt: skip
     return pd.DataFrame(recs, columns=["complaint_id", *SUMMARY_FIELDS])
+
+
+SUMMARY_PLACEHOLDER = "x" * 450  # a 60-word summary, rounded up (summaries do not exist yet)
+
+
+def _summary_render(r, text: str) -> str:
+    return f"complaint_id: {r['complaint_id']}\nnarrative: {text}\nsummary: {r['summary']}"
+
+
+def estimate_summary_judge_usd(
+    cfg: Config, rows: pd.DataFrame, model: str | None = None
+) -> float:
+    """Worst-case USD for judging `rows` with the summary judge's own (short) prompt."""
+    model = model or cfg.judge_model
+    system = f"[prompt {SUMMARY_JUDGE_PROMPT_VERSION}] {_SUMMARY_SYSTEM}"
+    ids = [str(c) for c in rows["complaint_id"]]
+    texts = [clean_text(str(t), cfg.max_chars) for t in rows["narrative"]]
+    total = 0.0
+    for i in range(0, len(ids), cfg.batch_size):
+        parts = [
+            _summary_render({"complaint_id": c, "summary": SUMMARY_PLACEHOLDER}, t)
+            for c, t in zip(ids[i : i + cfg.batch_size], texts[i : i + cfg.batch_size])
+        ]
+        user = "Judge these items.\n\n" + "\n\n---\n\n".join(parts)
+        est_in, est_out = estimate_request_tokens(system, user, len(parts), cfg.thinking)
+        total += estimate_run(1, est_in, est_out, model, cfg.prices)
+    return total

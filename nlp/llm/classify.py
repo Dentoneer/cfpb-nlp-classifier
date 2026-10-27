@@ -14,11 +14,11 @@ import pandas as pd
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.config import Config
 from nlp.data import clean_text
-from nlp.llm.client import GeminiClient, RateLimited, ServiceUnavailable
-from nlp.schema import PREDICTIONS_COLS
+from nlp.llm.client import MAX_OUTPUT_TOKENS, GeminiClient, RateLimited, ServiceUnavailable
+from nlp.schema import PREDICTIONS_COLS, split_label
 from nlp.sheets import taxonomy_snapshot_hash
 from nlp.store import JsonlCache
-from nlp.taxonomy import normalize_path, taxonomy_prompt_text
+from nlp.taxonomy import normalize_label, taxonomy_prompt_text
 
 T = TypeVar("T")
 _STR = {"type": "string"}
@@ -28,13 +28,11 @@ RESPONSE_SCHEMA: dict = {
         "type": "object",
         "properties": {
             "complaint_id": _STR,
-            "product": _STR,
-            "issue": _STR,
-            "sub_issue": _STR,
+            "label": _STR,
             "summary": _STR,
             "confidence": {"type": "number"},
         },
-        "required": ["complaint_id", "product", "issue", "sub_issue", "summary", "confidence"],
+        "required": ["complaint_id", "label", "summary", "confidence"],
     },
 }
 
@@ -47,19 +45,26 @@ _PARSED_COLS = [
 
 
 def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -> tuple[str, str]:
-    """Return (system, user). `batch` needs complaint_id and (already cleaned) narrative."""
+    """Return (system, user). `batch` needs complaint_id and (already cleaned) narrative.
+
+    `taxonomy_text` is the category listing from `taxonomy_prompt_text` (one line per label
+    with its description).
+    """
     system = (
         f"[prompt {prompt_version}] You classify US consumer financial complaints.\n"
-        "Classify each complaint into exactly one path (Product, Issue, Sub-issue) from the "
-        "taxonomy below. Copy the Product, Issue and Sub-issue strings exactly as written; "
-        'use the sub-issue "(none)" only where the taxonomy lists it.\n'
+        "The CATEGORIES list below has one entry per category: a line \"- label: <label>\" "
+        "(Product|Issue|Sub-issue) and an indented line \"description: ...\" saying what it "
+        "covers and when to use it. Read the descriptions to tell similar categories apart.\n"
+        "For each complaint choose exactly one label from the list and copy it verbatim: the "
+        "whole text after \"- label: \" on its line, with the | separators exactly as written. "
+        "Never invent or shorten a label.\n"
         "For each complaint also write a summary of at most 60 words that uses only facts "
         "stated in the complaint text (no guesses, no outside knowledge), and a confidence "
-        "between 0 and 1 that the chosen path is correct.\n"
+        "between 0 and 1 that the chosen label is correct.\n"
         "Return a JSON array with one object per complaint, following the response schema "
-        "(complaint_id, product, issue, sub_issue, summary, confidence). Use the given "
-        "complaint_id values unchanged and include every complaint exactly once.\n\n"
-        f"TAXONOMY:\n{taxonomy_text}"
+        "(complaint_id, label, summary, confidence). Use the given complaint_id values unchanged "
+        "and include every complaint exactly once.\n\n"
+        f"CATEGORIES:\n{taxonomy_text}"
     )
     parts = [
         f"complaint_id: {cid}\nnarrative: {text}"
@@ -70,10 +75,11 @@ def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -
 
 
 def estimate_request_tokens(system: str, user: str, n_rows: int, thinking: str) -> tuple[int, int]:
-    """Conservative (est_in, est_out) for Ledger.reserve (est_out is also max_output_tokens)."""
+    """Conservative (est_in, est_out) for Ledger.reserve (est_out is also max_output_tokens,
+    clamped to the model's output limit so Google never rejects the request for size)."""
     allowance = {"none": 0, "minimal": 0, "low": 512}.get(thinking, 2048)
     est_in = int((len(system) + len(user)) / 4 * RESERVE_SAFETY)
-    est_out = int(n_rows * (150 + allowance) * 1.5)
+    est_out = min(int(n_rows * (150 + allowance) * 1.5), MAX_OUTPUT_TOKENS)
     return est_in, est_out
 
 
@@ -96,7 +102,9 @@ def parse_and_validate(
 ) -> tuple[pd.DataFrame, list[str]]:
     """Return (valid rows with exact taxonomy strings, ids to retry).
 
-    Invalid path or confidence, or missing id -> retry; duplicate id -> first valid-or-not
+    The answer's `label` must match a taxonomy label exactly or after normalization (case,
+    whitespace, quotes); it is then split into product, issue and sub_issue. Invalid label or
+    confidence, or missing id -> retry; duplicate id -> first valid-or-not
     occurrence wins; unknown id -> ignored. Unparseable output retries every id.
     """
     try:
@@ -115,16 +123,11 @@ def parse_and_validate(
         if cid not in wanted or cid in seen:
             continue
         seen.add(cid)
-        sub = it.get("sub_issue")
-        path = normalize_path(
-            taxonomy,
-            it.get("product") or "",
-            it.get("issue") or "",
-            "(none)" if sub is None or str(sub).strip() == "" else sub,
-        )
+        label = normalize_label(taxonomy, it.get("label"))
         conf = _confidence(it.get("confidence"))
-        if path is None or conf is None:
+        if label is None or conf is None:
             continue
+        path = split_label(label)
         good.append(
             {
                 "complaint_id": cid,
@@ -198,6 +201,7 @@ def run_queue(
     schema: dict,
     request: Callable[[list[str]], tuple[str, str]],
     handle: Callable[[str, list[str]], list[str]],
+    tag: str | None = None,
 ) -> set[str]:
     """Shared sequential, spend-safe request loop (classification and judging).
 
@@ -229,7 +233,7 @@ def run_queue(
         # No usage metadata after a paid call: record the conservative estimate, never raise.
         in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
         out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
-        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
+        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok, tag=tag, rows=len(batch_ids))
         for cid in handle(resp.text, batch_ids):
             attempts[cid] = attempts.get(cid, 0) + 1
             if attempts[cid] > MAX_RETRIES:
@@ -251,10 +255,15 @@ def run_classification(
     thinking: str | None = None,
     *,
     taxonomy: pd.DataFrame,
+    descriptions: pd.DataFrame | None = None,
     limiter: RateLimiter | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> pd.DataFrame:
     """Classify `rows` (complaint_id, narrative) sequentially; resumable via `cache`.
+
+    `descriptions` (label, description) default to the saved descriptions stage; without one,
+    raises DescriptionsMissing ("Run Part 0 (descriptions) in notebook 03 first."). The
+    recorded prompt_version (and cache key) is `<prompt_version>+<descriptions fingerprint>`.
 
     Per request: reserve -> limiter.wait -> generate -> ledger.record -> cache.put per row.
     Returns every cached prediction for `rows`. When the cap stops the run, raises
@@ -265,7 +274,14 @@ def run_classification(
     prompt_version = prompt_version or cfg.prompt_version
     thinking = thinking or cfg.thinking
     limiter = limiter or RateLimiter(cfg.rpm)
-    tax_text = taxonomy_prompt_text(taxonomy)
+    from nlp.llm.describe import load_descriptions, prompt_tag  # avoids an import cycle
+
+    if descriptions is None:
+        descriptions = load_descriptions(cfg, taxonomy)
+    tax_text = taxonomy_prompt_text(taxonomy, descriptions)
+    # The recorded version names the exact description wording, so answers given with older
+    # (e.g. since edited) descriptions are never reused from the cache.
+    prompt_version = prompt_tag(prompt_version, descriptions)
     tax_hash = taxonomy_snapshot_hash(taxonomy)
 
     def key(cid: str) -> str:
@@ -302,7 +318,7 @@ def run_classification(
     failed = run_queue(
         queue, batch_size=cfg.batch_size, client=client, ledger=ledger, limiter=limiter,
         sleep=sleep, model=model, thinking=thinking, schema=RESPONSE_SCHEMA,
-        request=request, handle=handle,
+        request=request, handle=handle, tag=prompt_version,
     )  # fmt: skip
 
     if failed:

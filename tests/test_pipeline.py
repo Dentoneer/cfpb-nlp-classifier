@@ -49,7 +49,7 @@ def _cleanlab_inputs():
     from nlp.classifiers.base import probs_long
     from nlp.schema import path_id
 
-    paths = [("P1", "I1", "(none)"), ("P2", "I2", "S2")]
+    paths = [("P1", "I1", "S1"), ("P2", "I2", "S2")]
     pids = [path_id(*p) for p in paths]
     words = ["alpha beta gamma", "delta epsilon zeta"]
     train = pd.DataFrame(

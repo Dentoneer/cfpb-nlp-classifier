@@ -16,7 +16,7 @@ def test_load_config_overrides_artifacts_dir(tmp_path):
     cfg = colab.load_config(CONFIG, tmp_path / "phase1")
     assert cfg.artifacts_dir == tmp_path / "phase1"
     assert (tmp_path / "phase1").is_dir()
-    assert cfg.spend_cap_usd == 4.00
+    assert cfg.spend_cap_usd == 5.00
 
 
 def test_overrides_roundtrip_and_validation(tmp_path):
@@ -85,7 +85,7 @@ def _tax_rows():
             "complaint_id": ["1", "2", "3", "4"],
             "product": ["P1", "P1", "P2", "P2"],
             "issue": ["I1", "I2", "I3", "I3"],
-            "sub_issue": ["(none)"] * 4,
+            "sub_issue": ["S1"] * 4,
             "narrative": ["some text " * 20] * 4,
         }
     )
@@ -117,7 +117,7 @@ def test_check_fits_and_ledger_report(tmp_path):
     colab.check_fits(ledger, 0.50, "thing")
     with pytest.raises(colab.StageIncomplete, match="thing"):
         colab.check_fits(ledger, 1.50, "thing")
-    ledger.record("gemini-2.5-flash", "r", 1_000_000, 0)
+    ledger.record("gemini-3.5-flash-lite", "r", 1_000_000, 0)
     text = colab.ledger_report(ledger)
     assert "$0.30" in text and "$0.70" in text
 
@@ -161,7 +161,7 @@ def _synthetic(n=60):
     for i in range(n):
         k = i % 3
         rows.append(
-            (f"c{i:03d}", f"2026-01-{i % 28 + 1:02d}", f"P{k % 2}", f"I{k}", "(none)",
+            (f"c{i:03d}", f"2026-01-{i % 28 + 1:02d}", f"P{k % 2}", f"I{k}", f"S{k}",
              f"word{k} " * 40 + f"extra{i}", "Co", "TX")
         )  # fmt: skip
     return pd.DataFrame(rows, columns=COMPLAINTS_COLS)
@@ -197,7 +197,7 @@ def test_compare_runs_reports_accuracy_and_dollars(tmp_path):
     good = truth.assign(classifier="x")
 
     def paid():
-        ledger.record("gemini-2.5-flash", "r", 1_000_000, 0)
+        ledger.record("gemini-3.5-flash-lite", "r", 1_000_000, 0)
         return good
 
     out = colab.compare_runs({"a": paid, "b": lambda: good.iloc[:2]}, truth, ledger)
@@ -286,20 +286,20 @@ def test_apply_choices_is_rerun_safe(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     with pytest.raises(ValueError, match="PICK"):
         colab.apply_choices(cfg, require_pick=True, classifier_model=None)
-    cfg = colab.apply_choices(cfg, require_pick=True, classifier_model="gemini-3.8-flash")
+    cfg = colab.apply_choices(cfg, require_pick=True, classifier_model="gemini-3.5-flash-lite")
     f = tmp_path / "config_overrides.json"
     stamp = f.stat().st_mtime_ns
     # rerun with None everywhere: keeps the saved pick, writes nothing
     cfg2 = colab.load_config(CONFIG, tmp_path)
-    assert cfg2.classifier_model == "gemini-3.8-flash"
+    assert cfg2.classifier_model == "gemini-3.5-flash-lite"
     same = colab.apply_choices(cfg2, require_pick=True, classifier_model=None, batch_size=None)
     assert same == cfg2 and f.stat().st_mtime_ns == stamp
     # equal value: no write; different value: saved
-    colab.apply_choices(cfg2, classifier_model="gemini-3.8-flash", batch_size=cfg2.batch_size)
+    colab.apply_choices(cfg2, classifier_model="gemini-3.5-flash-lite", batch_size=cfg2.batch_size)
     assert f.stat().st_mtime_ns == stamp
     assert colab.apply_choices(cfg2, batch_size=25).batch_size == 25
     assert colab.load_config(CONFIG, tmp_path).batch_size == 25
-    assert "classifier gemini-3.8-flash" in capsys.readouterr().out
+    assert "classifier gemini-3.5-flash-lite" in capsys.readouterr().out
 
 
 def test_stage_paid_tolerates_two_percent_but_not_budget(tmp_path, capsys):
@@ -330,14 +330,15 @@ def test_measured_estimate_from_ledger(tmp_path):
     cfg = _cfg(tmp_path)
     ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
     rows = _tax_rows()  # 4 rows
-    assert colab.measured_usd_per_request(ledger, "gemini-2.5-flash") is None
-    assert colab.estimate_measured(cfg, ledger, rows) is None
-    ledger.record("gemini-2.5-flash", "a", 1_000_000, 0)  # $0.30
-    ledger.record("gemini-2.5-flash", "b", 3_000_000, 0)  # $0.90
+    assert colab.measured_usd_per_request(ledger, "gemini-3.5-flash-lite") is None
+    assert colab.estimate_measured(cfg, ledger, rows, model="gemini-3.5-flash-lite") is None
+    ledger.record("gemini-3.5-flash-lite", "a", 1_000_000, 0)  # $0.30
+    ledger.record("gemini-3.5-flash-lite", "b", 3_000_000, 0)  # $0.90
     ledger.record("gemini-3.1-flash-lite", "c", 1_000_000, 0)  # other model ignored
-    assert colab.measured_usd_per_request(ledger, "gemini-2.5-flash") == pytest.approx(0.60)
+    assert colab.measured_usd_per_request(ledger, "gemini-3.5-flash-lite") == pytest.approx(0.60)
     # 4 rows at batch 2 -> 2 requests x $0.60 x 1.5 safety, x2 runs
-    got = colab.estimate_measured(cfg, ledger, rows, batch_size=2, runs=2)
+    got = colab.estimate_measured(cfg, ledger, rows, model="gemini-3.5-flash-lite", batch_size=2,
+                                  runs=2)
     assert got == pytest.approx(2 * 2 * 0.60 * 1.5)
 
 
@@ -351,7 +352,11 @@ def test_phase_estimate_uses_measured_when_available(tmp_path, capsys):
     before = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2))
     assert not before["measured"].any()
     assert (before["usd"] == before["bound_usd"]).all()
-    ledger.record(cfg.classifier_model, "a", 1000, 100)
+    from nlp.llm.describe import STAGE_DESCRIPTIONS
+
+    store.write(cfg, STAGE_DESCRIPTIONS, _desc_stage(tax))
+    ledger.record(cfg.classifier_model, "a", 1000, 100, tag=colab.current_prompt_tag(cfg, tax),
+                  rows=10)  # a request with the current (v2) prompt
     after = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2)).set_index("stage")
     assert after.loc[P.STAGE_PRED_GEMINI, "measured"]
     assert after.loc[P.STAGE_PRED_GEMINI, "usd"] < after.loc[P.STAGE_PRED_GEMINI, "bound_usd"]
@@ -436,10 +441,13 @@ def test_stage_paid_budget_stop_with_money_left_is_not_saved(tmp_path):
 
         ids = re.findall(r"complaint_id: (\S+)", user)
         return LLMResponse(json.dumps([
-            {"complaint_id": i, "product": t["product"], "issue": t["issue"],
-             "sub_issue": t["sub_issue"], "summary": "s", "confidence": 0.9} for i in ids
+            {"complaint_id": i, "label": t["label"], "summary": "s", "confidence": 0.9}
+            for i in ids
         ]), 10, 3000)  # fmt: skip
 
+    from nlp.llm.describe import STAGE_DESCRIPTIONS
+
+    store.write(cfg, STAGE_DESCRIPTIONS, _desc_stage(tax))
     ledger = Ledger(tmp_path / "l.jsonl", 0.40, {"g": (1.0, 50.0)})  # reserve ~$0.33/batch
     client = FakeClient(answer)
     limiter = RateLimiter(10_000, sleep=lambda s: None)
@@ -521,3 +529,157 @@ def test_notebook_05_passes_summary_flags_and_weights():
 def test_readme_warns_one_spender_at_a_time():
     text = (CONFIG.parent.parent / "README.md").read_text(encoding="utf-8")
     assert "one person and one notebook" in text.lower()
+
+
+# ---- v2: descriptions ------------------------------------------------------------------
+
+
+def _desc_stage(tax, text="d"):
+    from nlp.llm.describe import DESCRIBE_VERSION
+
+    return pd.DataFrame({"label": tax["label"], "description": text, "model_id": "gemini-3.8-flash",
+                         "describe_version": DESCRIBE_VERSION})  # fmt: skip
+
+
+def test_estimate_works_before_descriptions_exist_and_uses_them_after(tmp_path):
+    from nlp import pipeline as P
+
+    cfg = _cfg(tmp_path)
+    rows = _tax_rows()
+    tax = build_taxonomy(rows)
+    before = colab.estimate_classification(cfg, rows, tax)  # placeholder descriptions
+    assert before > 0
+    store.write(cfg, P.STAGE_DESCRIPTIONS, _desc_stage(tax, "word " * 200))
+    assert colab.estimate_classification(cfg, rows, tax) > before
+
+
+def _describe_inputs():
+    rows = pd.DataFrame({
+        "complaint_id": [f"c{i}" for i in range(8)],
+        "product": ["P1"] * 4 + ["P2"] * 4,
+        "issue": ["I1", "I1", "I2", "I2"] * 2,
+        "sub_issue": ["S1", "S1", "S2", "S2"] * 2,
+        "narrative": [f"text {i} " * 30 for i in range(8)],
+    })  # fmt: skip
+    splits = pd.DataFrame({"complaint_id": rows["complaint_id"], "split": "train"})
+    return rows, splits, build_taxonomy(rows)
+
+
+def _describe_client():
+    import re
+
+    from nlp.llm.client import FakeClient, LLMResponse
+
+    def answer(model, system, user, schema, thinking):
+        labels = re.findall(r"^LABEL: (.+)$", user, re.MULTILINE)
+        return LLMResponse(json.dumps([{"label": x, "description": f"About {x}."} for x in labels]),
+                           100, 50)
+
+    return FakeClient(answer)
+
+
+def test_make_descriptions_stages_and_is_free_on_rerun(tmp_path):
+    from nlp import pipeline as P
+    from nlp.budget import RateLimiter
+
+    cfg = _cfg(tmp_path)
+    rows, splits, tax = _describe_inputs()
+    ledger = Ledger(tmp_path / "ledger.jsonl", 5.0, cfg.prices)
+    cache = store.JsonlCache(tmp_path / "gemini_cache.jsonl")
+    client = _describe_client()
+    lim = RateLimiter(10_000, sleep=lambda s: None)
+    d = colab.make_descriptions(cfg, rows, splits, tax, client, ledger, cache, lim)
+    assert store.exists(cfg, P.STAGE_DESCRIPTIONS) and len(d) == len(tax)
+    assert len(client.calls) == 2
+    again = colab.make_descriptions(cfg, rows, splits, tax, client, ledger, cache, lim)
+    assert len(client.calls) == 2 and again.equals(d)
+    # A stale stage (different category list) is rebuilt from the cache, still free.
+    store.write(cfg, P.STAGE_DESCRIPTIONS, d.iloc[1:])
+    fixed = colab.make_descriptions(cfg, rows, splits, tax, client, ledger, cache, lim)
+    assert len(fixed) == len(tax) and len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "exc, needle",
+    [
+        ("budget", "Budget reached"),
+        ("quota", "tomorrow"),
+        ("down", "later"),
+        ("rejected", "remove it from the list"),
+    ],
+)
+def test_make_descriptions_errors_are_plain_english(tmp_path, exc, needle):
+    from nlp.llm.client import FakeClient, RequestRejected, ServiceUnavailable
+
+    cfg = _cfg(tmp_path)
+    rows, splits, tax = _describe_inputs()
+
+    def boom(*a):
+        raise {
+            "budget": BudgetExceeded("cap"),
+            "quota": DailyQuotaExhausted(2),
+            "down": ServiceUnavailable("overloaded"),
+            "rejected": RequestRejected(404, "Gemini model 'x' is retired: remove it from the list."),
+        }[exc]
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", 5.0, cfg.prices)
+    with pytest.raises(colab.StageIncomplete, match=needle):
+        colab.make_descriptions(cfg, rows, splits, tax, FakeClient(boom), ledger,
+                                store.JsonlCache(tmp_path / "c.jsonl"))  # fmt: skip
+    assert not store.exists(cfg, "descriptions")
+
+
+class _WS:
+    id = 0
+
+    def __init__(self):
+        self.values = []
+
+    def update(self, values, range_name=None):
+        self.values = [list(r) for r in values]
+
+    def clear(self):
+        self.values = []
+
+    def get_all_records(self, numericise_ignore=()):
+        head, *body = self.values
+        return [dict(zip(head, r)) for r in body]
+
+
+class _SheetGC:
+    """Minimal fake gspread client."""
+
+    def __init__(self):
+        self.books = {}
+
+    def create(self, title):
+        from types import SimpleNamespace
+
+        ss = SimpleNamespace(url=f"https://fake/{len(self.books)}", sheet1=_WS())
+        self.books[ss.url] = ss
+        return ss
+
+    def open_by_url(self, url):
+        return self.books[url]
+
+
+def test_publish_descriptions_then_load_edits(tmp_path, capsys):
+    from nlp import pipeline as P
+
+    cfg = _cfg(tmp_path)
+    _, _, tax = _describe_inputs()
+    d = _desc_stage(tax)
+    store.write(cfg, P.STAGE_DESCRIPTIONS, d)
+    gc = _SheetGC()
+    url = colab.publish_descriptions(cfg, gc, tax, d)
+    assert colab.read_url(cfg, "taxonomy") == url
+    ws = gc.open_by_url(url).sheet1
+    assert ws.values[0][-1] == "description"
+    ws.values[1][-1] = "Marco wrote this."
+    out = colab.load_description_edits(cfg, gc, tax)
+    assert "Marco wrote this." in set(out["description"])
+    assert store.read(cfg, P.STAGE_DESCRIPTIONS).equals(out)
+    assert "1 description(s) changed" in capsys.readouterr().out
+    ws.values[2][-1] = ""
+    with pytest.raises(colab.StageIncomplete, match="empty"):
+        colab.load_description_edits(cfg, gc, tax)

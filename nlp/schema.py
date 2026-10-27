@@ -14,7 +14,9 @@ COMPLAINTS_COLS = [
     "company",
     "state",
 ]
-TAXONOMY_COLS = ["product", "issue", "sub_issue", "path_id"]
+TAXONOMY_COLS = ["product", "issue", "sub_issue", "path_id", "label"]
+DESCRIPTIONS_COLS = ["label", "description", "model_id", "describe_version"]
+LABEL_SEP = "|"
 SPLITS_COLS = ["complaint_id", "split", "hand_check", "self_consistency"]
 PREDICTIONS_COLS = [
     "complaint_id",
@@ -44,3 +46,14 @@ METRICS_COLS = [
 
 def path_id(product: str, issue: str, sub_issue: str) -> str:
     return f"{product} || {issue} || {sub_issue}"
+
+
+def label_of(product: str, issue: str, sub_issue: str) -> str:
+    """The single label Gemini answers with: `Product|Issue|Sub-issue` (CFPB wording)."""
+    return LABEL_SEP.join((product, issue, sub_issue))
+
+
+def split_label(label: str) -> tuple[str, str, str]:
+    """Inverse of `label_of` (names never contain `|`; build_taxonomy enforces it)."""
+    product, issue, sub_issue = label.split(LABEL_SEP)
+    return product, issue, sub_issue
