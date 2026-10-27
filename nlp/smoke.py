@@ -42,7 +42,7 @@ PRODUCTS = [
 ISSUES_PER_PRODUCT = [5, 4, 4, 4, 4, 4]  # 25 issues
 N_TWO_SUB_ISSUES = 15  # 15 issues x 2 sub-issues + 10 issues x "(none)" = 40 paths
 _REQ_ID = re.compile(r"^complaint_id: (\S+)$", re.MULTILINE)
-_QUOTED = re.compile(r"'(.*)'")
+_QUOTED = re.compile(r'"([^"]*)"')
 
 
 def smoke_config(artifacts_dir: Path) -> Config:
@@ -181,8 +181,10 @@ def make_fake_jev_client() -> FakeJevClient:
         nouls = {}
         for qid, q in questions.items():
             text = q["instructions"]
-            m = _QUOTED.search(text)
-            claimed = m.group(1) if m else "(none)"  # no quoted label -> "(none)" claim
+            if "no more specific sub-issue" in text:
+                claimed = "(none)"
+            else:
+                claimed = _QUOTED.findall(text)[-1]
             yes = claimed == truth[cid][index[qid]]
             r = random.Random(f"{cid}|jev|{qid}")
             yes = yes != (r.random() < 0.08)  # judge is wrong ~8% of the time
@@ -283,7 +285,9 @@ def run_smoke(
     # --- validators ---
     jev = S(
         P.STAGE_JEV,
-        lambda: P.run_jev(cfg, gem, test_df, jev_client, ledger, judge_cache, limiter),
+        lambda: P.run_jev(
+            cfg, gem, test_df, taxonomy, jev_client, ledger, judge_cache, limiter
+        ),
     )
     summary_flags = S(
         P.STAGE_SUMMARY_JUDGE,

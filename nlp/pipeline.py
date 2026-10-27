@@ -126,12 +126,13 @@ def _with_narrative(gemini: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame
 
 
 def run_jev(
-    cfg, gemini, test_df, client: JevClient, ledger, cache, limiter=None
+    cfg, gemini, test_df, taxonomy, client: JevClient, ledger, cache, limiter=None
 ) -> pd.DataFrame:
     """Jev answers (noul per level) for every Gemini prediction (paid, Jev-calling step)."""
     return _run_jev(
-        _with_narrative(gemini, test_df), cfg, client, ledger, cache, limiter=limiter
-    )
+        _with_narrative(gemini, test_df), cfg, client, ledger, cache,
+        taxonomy=taxonomy, limiter=limiter,
+    )  # fmt: skip
 
 
 def run_summary_judge(

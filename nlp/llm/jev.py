@@ -9,6 +9,7 @@ reserve -> limiter.wait -> system_one -> ledger.record -> cache.put, with 429 ba
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -25,7 +26,8 @@ from nlp.llm.client import RateLimited
 from nlp.schema import VALIDATOR_RESULTS_COLS
 from nlp.store import JsonlCache
 
-JEV_PROMPT_VERSION = "jev-v1"
+JEV_PROMPT_VERSION = "jev-v2"
+RESERVE_SAFETY = 1.5  # multiplier on the input-token guess, as for Gemini
 JEV_FIELDS = ["product_ok", "issue_ok", "sub_issue_ok"]
 _LEVEL_OF = {"product_ok": "product", "issue_ok": "issue", "sub_issue_ok": "sub_issue"}
 _PLACEHOLDER = "x" * 40  # label stand-in for cost estimates before Gemini has labelled
@@ -41,6 +43,14 @@ class JevResponse:
 
 class JevError(Exception):
     """Non-429 HTTP error or an unreadable response from Jev."""
+
+
+class JevParseError(JevError):
+    """A (possibly paid) 200 response that could not be read; carries any usage it reported."""
+
+    def __init__(self, message: str, input_tokens: int | None = None):
+        super().__init__(message)
+        self.input_tokens = input_tokens
 
 
 class JevClient(Protocol):
@@ -64,7 +74,8 @@ def parse_jev_response(body: object, question_ids: list[str], model: str = "") -
     {"type": "noul", "noul": p, ...} or a bare number. Raises JevError naming the keys found.
     """
     if not isinstance(body, dict):
-        raise JevError(f"Jev response is not a JSON object: {str(body)[:200]!r}")
+        raise JevParseError(f"Jev response is not a JSON object: {str(body)[:200]!r}")
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
     found: dict[str, float] = {}
     for cont in (body.get("answers"), body.get("nouls"), body):
         if not isinstance(cont, dict):
@@ -78,11 +89,11 @@ def parse_jev_response(body: object, question_ids: list[str], model: str = "") -
         for k in ("answers", "nouls"):
             if isinstance(body.get(k), dict):
                 keys[k] = sorted(body[k])
-        raise JevError(
+        raise JevParseError(
             f"could not find a noul in [0, 1] for each of {question_ids} in the Jev response; "
-            f"keys found: {keys}"
+            f"keys found: {keys}",
+            usage.get("input_tokens"),
         )
-    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
     return JevResponse(
         found,
         usage.get("input_tokens"),
@@ -95,7 +106,7 @@ class HttpJevClient:
     """Raw httpx client for POST {base_url}/v1/systemone (no typesafe-sdk dependency)."""
 
     def __init__(
-        self, api_key: str, base_url: str = "https://api.typesafe.ai", timeout: float = 60
+        self, api_key: str | None, base_url: str = "https://api.typesafe.ai", timeout: float = 60
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -104,6 +115,11 @@ class HttpJevClient:
     def system_one(self, model: str, state: str, questions: dict[str, dict]) -> JevResponse:
         import httpx
 
+        if not self.api_key:
+            raise JevError(
+                "No Jev API key: add a TYPESAFE_API_KEY secret in Colab (key icon, Notebook "
+                "access on), restart the session and rerun the setup cell."
+            )
         try:
             r = httpx.post(
                 f"{self.base_url}/v1/systemone",
@@ -128,7 +144,7 @@ class HttpJevClient:
         try:
             body = r.json()
         except ValueError as e:
-            raise JevError(f"Jev returned non-JSON: {r.text[:200]!r}") from e
+            raise JevParseError(f"Jev returned non-JSON: {r.text[:200]!r}") from e
         return parse_jev_response(body, list(questions), model)
 
 
@@ -144,22 +160,34 @@ class FakeJevClient:
         return self.responder(model, state, questions)
 
 
-def build_jev_questions(product: str, issue: str, sub_issue: str) -> dict[str, dict]:
-    """Three testable claims about the complaint, one per hierarchy level."""
-    if str(sub_issue).strip() in ("", "(none)"):
-        sub = "This complaint does not fit any more specific sub-issue within the issue above."
-    else:
-        sub = f"This complaint is about the specific sub-issue: '{sub_issue}'."
+def build_jev_questions(
+    product: str, issue: str, sub_issue: str, issue_has_sub_issues: bool = True
+) -> dict[str, dict]:
+    """Testable claims about the complaint, one per hierarchy level.
+
+    No sub-issue question when Gemini says "(none)" and the issue has no sub-issues at all in
+    the taxonomy (nothing to check). Sub-issue claims name the issue so they stand alone.
+    """
     claims = {
-        "product_ok": f"This complaint is about the financial product: '{product}'.",
-        "issue_ok": f"The main problem the consumer reports is: '{issue}'.",
-        "sub_issue_ok": sub,
+        "product_ok": f'This complaint is about the financial product: "{product}".',
+        "issue_ok": f'The main problem the consumer reports is: "{issue}".',
     }
+    if str(sub_issue).strip() in ("", "(none)"):
+        if issue_has_sub_issues:
+            claims["sub_issue_ok"] = (
+                f'Within the issue "{issue}", no more specific sub-issue applies; '
+                "the issue alone describes this complaint."
+            )
+    else:
+        claims["sub_issue_ok"] = (
+            f'Within the issue "{issue}", this complaint is specifically about: "{sub_issue}".'
+        )
     return {k: {"type": "noul", "instructions": v} for k, v in claims.items()}
 
 
 def estimate_jev_tokens(state: str, questions: dict[str, dict]) -> int:
-    return len(json.dumps({"state": state, "questions": questions})) // 4
+    """Conservative input-token estimate (chars/4 x RESERVE_SAFETY)."""
+    return int(len(json.dumps({"state": state, "questions": questions})) / 4 * RESERVE_SAFETY)
 
 
 def estimate_jev_usd(cfg: Config, rows: pd.DataFrame, model: str | None = None) -> float:
@@ -191,15 +219,19 @@ def run_jev(
     ledger: Ledger,
     cache: JsonlCache,
     *,
+    taxonomy: pd.DataFrame,
     limiter: RateLimiter | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> pd.DataFrame:
     """Ask Jev about each row (complaint_id, narrative, product, issue, sub_issue); resumable.
 
-    Returns jev_results: complaint_id, product_ok, issue_ok, sub_issue_ok (noul P(yes)),
+    Returns jev_results: complaint_id, product_ok, issue_ok, sub_issue_ok (noul P(yes); NaN if
+    not asked),
     model_id - for every row with a fresh cached answer. A cached answer is stale (a miss)
     if the judged labels differ from the row's current labels. On budget exhaustion stops and
     returns what is done; a daily-quota 429 raises DailyQuotaExhausted(remaining_rows).
+    `taxonomy` decides whether an issue has sub-issues; when it has none and Gemini says
+    "(none)", no sub-issue question is asked and sub_issue_ok is NaN for that row.
     """
     model = cfg.jev_model
     limiter = limiter or RateLimiter(cfg.rpm)
@@ -221,11 +253,19 @@ def run_jev(
             return None
         return rec
 
+    with_subs = {
+        (p, i)
+        for p, i, sub in zip(taxonomy["product"], taxonomy["issue"], taxonomy["sub_issue"])
+        if sub != "(none)"
+    }
+
     queue = [c for c in ids if fresh(c) is None]
     for i, cid in enumerate(queue):
         r = by_id[cid]
         state = clean_text(str(r["narrative"]), cfg.max_chars)
-        questions = build_jev_questions(r["product"], r["issue"], r["sub_issue"])
+        questions = build_jev_questions(
+            r["product"], r["issue"], r["sub_issue"], (r["product"], r["issue"]) in with_subs
+        )
         est_in = estimate_jev_tokens(state, questions)
         try:
             resp = _call_with_backoff(
@@ -238,36 +278,45 @@ def run_jev(
             if e.daily:  # everything finished so far is already cached
                 raise DailyQuotaExhausted(len(queue) - i) from e
             raise
+        except JevParseError as e:  # the call was paid even though we cannot read it
+            ledger.record(model, uuid.uuid4().hex, e.input_tokens or est_in, 0)
+            raise
         # Ledger first: a crash after a paid response must never lose the charge.
         in_tok = est_in if resp.input_tokens is None else resp.input_tokens
         ledger.record(model, uuid.uuid4().hex, in_tok, 0)  # output tokens are free
-        missing = [f for f in JEV_FIELDS if f not in resp.nouls]
+        missing = [f for f in questions if f not in resp.nouls]
         if missing:
             raise JevError(f"Jev response for {cid} lacks answers {missing}: {sorted(resp.nouls)}")
         cache.put(
             key(cid),
             {
                 "complaint_id": cid,
-                **{f: float(resp.nouls[f]) for f in JEV_FIELDS},
+                **{f: (float(resp.nouls[f]) if f in questions else None) for f in JEV_FIELDS},
                 "model_id": model,
                 **seen(cid),
             },
         )
     cols = ["complaint_id", *JEV_FIELDS, "model_id"]
-    return pd.DataFrame(
+    df = pd.DataFrame(
         [{c: v[c] for c in cols} for k in ids if (v := fresh(k)) is not None], columns=cols
     )
+    return df.astype({f: float for f in JEV_FIELDS})  # None -> NaN
 
 
 def v_jev(jev_results: pd.DataFrame) -> pd.DataFrame:
     """validator_results rows (validator `jev`): score = noul, verdict = score >= 0.5.
 
-    Levels product / issue / sub_issue plus path (score = product of the three noul values).
+    Levels product / issue / sub_issue plus path (score = product of the noul values asked;
+    a level that was not asked (NaN) emits no row and is left out of the path product).
     """
     out = []
     for r in jev_results.itertuples(index=False):
-        scores = {lv: float(getattr(r, f)) for f, lv in _LEVEL_OF.items()}
-        scores["path"] = scores["product"] * scores["issue"] * scores["sub_issue"]
+        scores = {
+            lv: float(getattr(r, f))
+            for f, lv in _LEVEL_OF.items()
+            if not pd.isna(getattr(r, f))
+        }
+        scores["path"] = math.prod(scores.values())
         for level, s in scores.items():
             out.append((r.complaint_id, "jev", level, s >= 0.5, s))
     return pd.DataFrame(out, columns=VALIDATOR_RESULTS_COLS)

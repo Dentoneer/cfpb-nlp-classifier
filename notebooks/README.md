@@ -2,11 +2,11 @@
 
 Six thin notebooks that run Phase 1 on the real CFPB data. They only call functions in the `nlp/`
 package; each one starts with the same setup cell (clone/pull the repo, install, mount Drive, read the
-`GEMINI_API_KEY` and `TYPESAFE_API_KEY` Colab secrets, authorise Google Sheets).
+`GEMINI_API_KEY` and `TYPESAFE_API_KEY` Colab secrets (the second is optional until notebook 04), authorise Google Sheets).
 
-Before the first run: in Colab add two secrets, `GEMINI_API_KEY` (classifier and summary judge) and
-`TYPESAFE_API_KEY` (Jev, the yes/no validator), via the key icon in the left bar, each with
-"Notebook access" on.
+Before the first run: in Colab add a secret named `GEMINI_API_KEY` (key icon, left bar) with
+"Notebook access" on. Notebook 04's Jev validator also needs a `TYPESAFE_API_KEY` secret set the same
+way; notebooks 00-03 run without it (setup just prints a note).
 
 | # | Notebook | Runtime | Time | Paid cost |
 |---|----------|---------|------|-------------|

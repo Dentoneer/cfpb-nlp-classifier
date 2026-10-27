@@ -128,13 +128,35 @@ def check_code_fresh(head_at_import: str | None, head_now: str | None) -> None:
         raise RuntimeError(RESTART_MSG)
 
 
+def read_secrets(userdata) -> tuple[str, str | None]:
+    """(Gemini key, Jev key or None). Gemini's secret is required; the Jev one is optional."""
+    try:
+        api_key = userdata.get("GEMINI_API_KEY")
+    except Exception as e:  # secret missing or notebook access not granted
+        raise RuntimeError(
+            "GEMINI_API_KEY not found. In Colab open the key icon (Secrets) on the left, add "
+            "GEMINI_API_KEY and switch 'Notebook access' on."
+        ) from e
+    try:
+        jev_key = userdata.get("TYPESAFE_API_KEY") or None
+    except Exception:  # noqa: BLE001 - Colab raises various errors for a missing secret
+        jev_key = None
+    if jev_key is None:
+        print(
+            "Note: no TYPESAFE_API_KEY secret - that is fine now; it is needed only for "
+            "notebook 04's Jev step."
+        )
+    return api_key, jev_key
+
+
 def setup(
     repo_dir: str = "/content/cfpb-nlp-classifier",
     drive_subdir: str = "cfpb-nlp-classifier/phase1",
 ):
     """Mount Drive, load config, fetch the Gemini and Jev keys, authorise Sheets.
 
-    Returns (cfg, gc, api_key, jev_key).
+    Returns (cfg, gc, api_key, jev_key); jev_key is None if the optional TYPESAFE_API_KEY
+    secret is not set (only notebook 04's Jev step needs it).
     """
     check_code_fresh(_HEAD_AT_IMPORT, _git_head(Path(repo_dir)))
     from google.colab import auth, drive, userdata
@@ -142,15 +164,7 @@ def setup(
     drive.mount("/content/drive")
     artifacts = Path("/content/drive/MyDrive") / drive_subdir
     cfg = load_config(Path(repo_dir) / "config" / "phase1.yaml", artifacts)
-    keys = {}
-    for secret in ("GEMINI_API_KEY", "TYPESAFE_API_KEY"):
-        try:
-            keys[secret] = userdata.get(secret)
-        except Exception as e:  # secret missing or notebook access not granted
-            raise RuntimeError(
-                f"{secret} not found. In Colab open the key icon (Secrets) on the left, add "
-                f"{secret} and switch 'Notebook access' on."
-            ) from e
+    api_key, jev_key = read_secrets(userdata)
     auth.authenticate_user()
     import google.auth
     import gspread
@@ -160,7 +174,7 @@ def setup(
     print(f"Ready. Outputs go to {artifacts}")
     print(f"Saved choices applied: {read_overrides(artifacts) or 'none yet'}")
     print(f"Classifier {cfg.classifier_model} | judge {cfg.judge_model} | cap ${cfg.spend_cap_usd:.2f}")
-    return cfg, gc, keys["GEMINI_API_KEY"], keys["TYPESAFE_API_KEY"]
+    return cfg, gc, api_key, jev_key
 
 
 def open_tools(cfg: Config) -> tuple[Ledger, JsonlCache, JsonlCache, RateLimiter]:

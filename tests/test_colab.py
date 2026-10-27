@@ -393,3 +393,21 @@ def test_phase_estimate_prices_jev_step_per_request(tmp_path, capsys):
         min(len(rows) * (1000 * 0.042 / 1e6) * colab.MEASURED_SAFETY, after.loc[P.STAGE_JEV, "bound_usd"])
     )
     capsys.readouterr()
+
+
+def test_read_secrets_jev_key_is_optional(capsys):
+    class UD:
+        def __init__(self, d):
+            self.d = d
+
+        def get(self, name):
+            if name not in self.d:
+                raise KeyError(name)
+            return self.d[name]
+
+    assert colab.read_secrets(UD({"GEMINI_API_KEY": "g", "TYPESAFE_API_KEY": "t"})) == ("g", "t")
+    assert capsys.readouterr().out == ""
+    assert colab.read_secrets(UD({"GEMINI_API_KEY": "g"})) == ("g", None)
+    assert "notebook 04" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        colab.read_secrets(UD({"TYPESAFE_API_KEY": "t"}))
