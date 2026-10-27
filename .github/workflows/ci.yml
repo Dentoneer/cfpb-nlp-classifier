@@ -27,3 +27,6 @@ jobs:
       - name: Test
         # Exit code 5 = no tests collected yet; treat as pass until the first tests land.
         run: pytest -q || [ $? -eq 5 ]
+
+      - name: Check notebooks
+        run: python -m nlp.tools.check_notebooks notebooks/

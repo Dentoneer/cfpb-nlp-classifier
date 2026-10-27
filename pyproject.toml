@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfpb-nlp"
+version = "0.1.0"
+description = "CFPB complaint NLP classifier experiment (Gemini + classic classifiers, validators)"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "pyyaml",
+    "google-genai",
+    "scipy",
+    "duckdb",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "cleanlab"]
+# Heavy libs: never import at module top level anywhere in nlp/.
+ml = ["sentence-transformers", "transformers", "torch", "cleanlab"]
+colab = ["gspread", "google-auth"]
+
+[tool.setuptools.packages.find]
+include = ["nlp*"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["notebooks"]  # Colab cells use ! and % magics; checked by nlp.tools.check_notebooks
+
+[tool.pytest.ini_options]
+markers = ["slow: needs GPU, network, or API access (skipped by default)"]
+addopts = "-m 'not slow'"
