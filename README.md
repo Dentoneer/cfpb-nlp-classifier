@@ -64,6 +64,10 @@ on the Product level, to build the real thing?).
    `https://colab.research.google.com/github/Dentoneer/cfpb-nlp-classifier/blob/main/notebooks/00_setup.ipynb`.
    Open the other notebooks the same way (change `00_setup` in the address) when their turn comes.
 
+**Whose Drive and keys?** Whoever runs the notebooks uses their own Colab Secrets and their own
+Google Drive, and all outputs land in that person's Drive. To work together, the runner shares the
+Drive folder `cfpb-nlp-classifier` and the review Sheet with the other person.
+
 **How to run a notebook:** click the play button on each cell and wait for the green check before
 the next one. Do this one cell at a time for 03 and 04, so you read the cost estimate before the
 money is spent. The first time, Colab asks to access your Google Drive and Google Sheets. Click
@@ -99,7 +103,7 @@ Drive.
 **03 Gemini (money is spent here).**
 - *Part A, model bake-off (up to ~$0.30).* Four Gemini models try the same 50 complaints. Look at
   the `path` column (all three levels right) and `usd`. Type the winner into the pick cell and run it.
-- *Part B, batch size and thinking (~$0.15).* Keep batch size 10 unless 25 is just as accurate. Pick
+- *Part B, batch size and thinking (~$0.05-0.15).* Keep batch size 10 unless 25 is just as accurate. Pick
   the lowest thinking level that keeps accuracy.
 - *Part C is optional.* Only if accuracy looks poor. It needs a code change (ask Claude), so skip it
   on a first run.
@@ -118,9 +122,9 @@ decision. Free, a few minutes.
 
 ### What to do if a notebook stops
 
-- **"Budget reached" or "would exceed the cap".** Stop. The $4.00 cap did its job. Nothing is lost.
+- **"Budget reached ..." or "would need about $X but only $Y of the $4.00 cap is left".** Stop. The $4.00 cap did its job. Nothing is lost.
   Tell Claude what the ledger says; do not try to get around it.
-- **"Daily quota exhausted".** Google limits how many requests you can send per day. Rerun the same
+- **"daily request quota is used up" (or "daily Gemini request quota is used up").** Google limits how many requests you can send per day. Rerun the same
   cell tomorrow. Finished rows are cached, so you do not pay again.
 - **"Restart session (Runtime menu > Restart session), then rerun this cell".** Do exactly that.
   The code on GitHub changed while your session was open. Saved results and choices on Drive are kept.

@@ -3,7 +3,7 @@
 _Last updated: 2026-10-27_
 
 ## Current status
-- **Phase 1 code complete** on branch `feat/phase1-nlp` (14 tasks + Jev task, 172+ tests passing).
+- **Phase 1 code complete** on branch `feat/phase1-nlp` (14 tasks + Jev task, 179 tests passing).
   One PR to `main` is pending the final whole-branch review. Notebooks clone `main`, so the PR
   must be merged before Marco can run them.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
