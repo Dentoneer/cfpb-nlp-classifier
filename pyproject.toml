@@ -28,6 +28,7 @@ include = ["nlp*"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["notebooks"]  # Colab cells use ! and % magics; checked by nlp.tools.check_notebooks
 
 [tool.pytest.ini_options]
 markers = ["slow: needs GPU, network, or API access (skipped by default)"]

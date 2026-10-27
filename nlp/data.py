@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 
 import duckdb
 import pandas as pd
@@ -152,3 +153,14 @@ def product_counts_by_month(source: str, params: FilterParams) -> pd.DataFrame:
     ).df()
     con.close()
     return df
+
+
+def max_date_received(source: str) -> date:
+    """Latest `date_received` among rows with a narrative (the data's end date)."""
+    con = _connect()
+    d = con.execute(
+        f"""SELECT max(CAST(date_received AS DATE)) FROM read_parquet({_quote(source)})
+            WHERE consumer_complaint_narrative IS NOT NULL"""
+    ).fetchone()[0]
+    con.close()
+    return d

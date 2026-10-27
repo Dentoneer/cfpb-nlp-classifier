@@ -8,6 +8,7 @@ from nlp.data import (
     FilterParams,
     clean_text,
     load_clean,
+    max_date_received,
     product_counts_by_month,
 )
 from nlp.schema import COMPLAINTS_COLS
@@ -157,6 +158,15 @@ def test_product_counts_by_month(tmp_path):
     out = product_counts_by_month(write(tmp_path, rows), PARAMS)
     assert list(out.columns) == ["month", "product", "issue", "n"]
     assert dict(zip(out["month"], out["n"])) == {"2025-03": 2, "2025-04": 1}
+
+
+def test_max_date_received_ignores_rows_without_narrative(tmp_path):
+    rows = [
+        row(date_received=pd.Timestamp("2025-03-05", tz="UTC")),
+        row(date_received=pd.Timestamp("2025-04-09", tz="UTC")),
+        row(date_received=pd.Timestamp("2025-05-01", tz="UTC"), consumer_complaint_narrative=None),
+    ]
+    assert str(max_date_received(write(tmp_path, rows))) == "2025-04-09"
 
 
 @pytest.mark.slow

@@ -1,0 +1,403 @@
+"""Glue for the Colab notebooks: setup, spend-safe staging, estimates, result summaries.
+
+Notebooks stay thin: they call these helpers plus the `nlp.pipeline` functions. Nothing here
+needs Colab except `setup()` (its Colab/gspread imports are lazy), so the rest is unit-tested.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import math
+from collections.abc import Callable, Iterable
+from pathlib import Path
+
+import pandas as pd
+
+from nlp import pipeline as P
+from nlp import store
+from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter, estimate_run
+from nlp.config import Config
+from nlp.data import clean_text, load_clean
+from nlp.llm.classify import build_prompt, estimate_request_tokens
+from nlp.review import count_verdicts
+from nlp.sheets import read_review_sheet
+from nlp.store import JsonlCache
+from nlp.taxonomy import taxonomy_prompt_text
+
+REPO_URL = "https://github.com/Dentoneer/cfpb-nlp-classifier"
+OVERRIDES_FILE = "config_overrides.json"
+LEVELS4 = ["product", "issue", "sub_issue", "path"]
+STAGE_FILTER_REPORT = "filter_report"
+
+
+class StageIncomplete(Exception):
+    """A paid or manual step did not finish; the message tells Marco what to do next."""
+
+
+# --------------------------------------------------------------------------- config / setup
+
+
+def load_config(config_path: Path, artifacts_dir: Path) -> Config:
+    """Config from YAML with artifacts_dir replaced, then Marco's saved overrides applied."""
+    cfg = dataclasses.replace(Config.load(Path(config_path)), artifacts_dir=Path(artifacts_dir))
+    Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
+    f = Path(artifacts_dir) / OVERRIDES_FILE
+    if f.exists():
+        cfg = dataclasses.replace(cfg, **json.loads(f.read_text(encoding="utf-8")))
+    return cfg
+
+
+def save_overrides(cfg: Config, **changes) -> Config:
+    """Persist config choices (e.g. the bake-off winner) on Drive; every notebook applies them."""
+    fields = {f.name for f in dataclasses.fields(Config)} - {"artifacts_dir", "prices"}
+    bad = set(changes) - fields
+    if bad:
+        raise ValueError(f"not a settable config field: {sorted(bad)}")
+    new = dataclasses.replace(cfg, **changes)
+    for field in ("classifier_model", "judge_model"):
+        if getattr(new, field) not in (cfg.prices or {}):
+            raise ValueError(f"{field} {getattr(new, field)!r} has no price in config 'prices'")
+    if new.classifier_model == new.judge_model:
+        raise ValueError("judge model must differ from the classifier model")
+    f = Path(cfg.artifacts_dir) / OVERRIDES_FILE
+    old = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    f.write_text(json.dumps({**old, **changes}, indent=2), encoding="utf-8")
+    return new
+
+
+def setup(
+    repo_dir: str = "/content/cfpb-nlp-classifier",
+    drive_subdir: str = "cfpb-nlp-classifier/phase1",
+):
+    """Mount Drive, load config, fetch the Gemini key, authorise Sheets -> (cfg, gc, api_key)."""
+    from google.colab import auth, drive, userdata
+
+    drive.mount("/content/drive")
+    artifacts = Path("/content/drive/MyDrive") / drive_subdir
+    cfg = load_config(Path(repo_dir) / "config" / "phase1.yaml", artifacts)
+    try:
+        api_key = userdata.get("GEMINI_API_KEY")
+    except Exception as e:  # secret missing or notebook access not granted
+        raise RuntimeError(
+            "GEMINI_API_KEY not found. In Colab open the key icon (Secrets) on the left, add "
+            "GEMINI_API_KEY and switch 'Notebook access' on."
+        ) from e
+    auth.authenticate_user()
+    import google.auth
+    import gspread
+
+    creds, _ = google.auth.default()
+    gc = gspread.authorize(creds)
+    print(f"Ready. Outputs go to {artifacts}")
+    print(f"Classifier {cfg.classifier_model} | judge {cfg.judge_model} | cap ${cfg.spend_cap_usd:.2f}")
+    return cfg, gc, api_key
+
+
+def open_tools(cfg: Config) -> tuple[Ledger, JsonlCache, JsonlCache, RateLimiter]:
+    """(ledger, gemini cache, judge cache, rate limiter) in the shared artifacts dir."""
+    art = Path(cfg.artifacts_dir)
+    ledger = Ledger(art / "ledger.jsonl", cfg.spend_cap_usd, cfg.prices)
+    return (
+        ledger,
+        JsonlCache(art / "gemini_cache.jsonl"),
+        JsonlCache(art / "judge_cache.jsonl"),
+        RateLimiter(cfg.rpm),
+    )
+
+
+# --------------------------------------------------------------------------- staging
+
+
+def stage_paid(
+    cfg: Config, name: str, fn: Callable[[], pd.DataFrame], expected_ids: Iterable[str]
+) -> pd.DataFrame:
+    """`store.stage` for Gemini steps: never saves a partial result.
+
+    Paid responses are already in the JSONL cache, so rerunning the cell later only pays for
+    the rows still missing.
+    """
+    if store.exists(cfg, name):
+        return store.read(cfg, name)
+    want = {str(i) for i in expected_ids}
+    try:
+        df = fn()
+    except DailyQuotaExhausted as e:
+        raise StageIncomplete(
+            f"Gemini's daily request quota is used up ({e.remaining_rows} rows still to do). "
+            "Everything finished is saved - rerun this cell tomorrow."
+        ) from None
+    except BudgetExceeded as e:
+        raise StageIncomplete(f"Budget reached ({e}). Nothing more was spent.") from None
+    done = len(want & set(df["complaint_id"].astype(str))) if len(df) else 0
+    if done < len(want):
+        raise StageIncomplete(
+            f"{done} of {len(want)} complaints done for '{name}'. Either the budget cap was "
+            "reached (see the ledger line below) or some rows failed validation (see messages "
+            "above). Finished rows are saved; rerun this cell to retry the rest."
+        )
+    store.write(cfg, name, df)
+    return df
+
+
+def always_write(cfg: Config) -> Callable[[str, Callable[[], pd.DataFrame]], pd.DataFrame]:
+    """Like `store.stage` but always recomputes and overwrites (for results that can change)."""
+
+    def run(name: str, fn: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+        df = fn()
+        store.write(cfg, name, df)
+        return df
+
+    return run
+
+
+def publish_once(cfg: Config, name: str, create: Callable[[], str]) -> str:
+    """Create a Google Sheet once; later runs reuse the saved URL instead of making duplicates."""
+    f = Path(cfg.artifacts_dir) / f"{name}_url.txt"
+    if f.exists():
+        return f.read_text(encoding="utf-8").strip()
+    url = create()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(url, encoding="utf-8")
+    return url
+
+
+def read_url(cfg: Config, name: str) -> str:
+    f = Path(cfg.artifacts_dir) / f"{name}_url.txt"
+    if not f.exists():
+        raise StageIncomplete(f"No saved '{name}' sheet URL yet - run the earlier notebook first.")
+    return f.read_text(encoding="utf-8").strip()
+
+
+# --------------------------------------------------------------------------- money
+
+
+def estimate_classification(
+    cfg: Config,
+    rows: pd.DataFrame,
+    taxonomy: pd.DataFrame,
+    *,
+    model: str | None = None,
+    batch_size: int | None = None,
+    thinking: str | None = None,
+    runs: int = 1,
+) -> float:
+    """Conservative USD estimate (the same token estimate the spend guard reserves with)."""
+    model = model or cfg.classifier_model
+    bs = batch_size or cfg.batch_size
+    thinking = thinking or cfg.thinking
+    tax = taxonomy_prompt_text(taxonomy)
+    text = [clean_text(str(t), cfg.max_chars) for t in rows["narrative"]]
+    ids = [str(c) for c in rows["complaint_id"]]
+    total = 0.0
+    for i in range(0, len(ids), bs):
+        batch = pd.DataFrame({"complaint_id": ids[i : i + bs], "narrative": text[i : i + bs]})
+        system, user = build_prompt(batch, tax, cfg.prompt_version)
+        est_in, est_out = estimate_request_tokens(system, user, len(batch), thinking)
+        total += estimate_run(1, est_in, est_out, model, cfg.prices)
+    return runs * total
+
+
+def check_fits(ledger: Ledger, estimate_usd: float, label: str) -> None:
+    """Print the estimate against the remaining cap; raise StageIncomplete if it won't fit."""
+    left = ledger.cap_usd - ledger.spent()
+    print(f"{label}: estimated up to ${estimate_usd:.2f}; remaining cap ${left:.2f}")
+    if estimate_usd > left:
+        raise StageIncomplete(
+            f"{label} would need up to ${estimate_usd:.2f} but only ${left:.2f} of the "
+            f"${ledger.cap_usd:.2f} cap is left. Nothing was spent."
+        )
+
+
+def ledger_report(ledger: Ledger) -> str:
+    spent = ledger.spent()
+    return (
+        f"Gemini spend so far: ${spent:.2f} of ${ledger.cap_usd:.2f} cap "
+        f"(${ledger.cap_usd - spent:.2f} remaining)"
+    )
+
+
+# --------------------------------------------------------------------------- scoring helpers
+
+
+def accuracy_by_level(pred: pd.DataFrame, truth: pd.DataFrame) -> dict[str, float]:
+    """Share of predicted complaints matching the CFPB label per level (and full path)."""
+    cols = ["product", "issue", "sub_issue"]
+    m = pred.drop_duplicates("complaint_id").merge(
+        truth[["complaint_id", *cols]].drop_duplicates("complaint_id"),
+        on="complaint_id",
+        suffixes=("", "_t"),
+    )
+    if m.empty:
+        return {lv: math.nan for lv in LEVELS4}
+    ok = {lv: m[lv].astype(str) == m[f"{lv}_t"].astype(str) for lv in cols}
+    out = {lv: float(ok[lv].mean()) for lv in cols}
+    out["path"] = float((ok["product"] & ok["issue"] & ok["sub_issue"]).mean())
+    return out
+
+
+def _md_table(df: pd.DataFrame) -> str:
+    def fmt(v) -> str:
+        return f"{v:.3f}" if isinstance(v, float) and not pd.isna(v) else str(v)
+
+    head = "| " + " | ".join(map(str, df.columns)) + " |"
+    sep = "|" + "---|" * len(df.columns)
+    body = ["| " + " | ".join(fmt(v) for v in r) + " |" for r in df.itertuples(index=False)]
+    return "\n".join([head, sep, *body])
+
+
+def results_markdown(scored: dict, spent_usd: float, cap_usd: float) -> str:
+    """Markdown results summary: decision, adjusted accuracy, both leaderboards, spend."""
+    d = scored["decision"]
+    lines = [
+        f"## Phase 1 result: {'GO' if d['go'] else 'NO-GO'}",
+        "",
+        *[f"- {r}" for r in d["reasons"]],
+        "",
+        "### Adjusted accuracy (Gemini vs your hand check, reweighted to the whole test set)",
+        _md_table(scored["adjusted"]),
+        "",
+        "### Classifier leaderboard (vs CFPB labels)",
+        _md_table(scored["classifier_board"]),
+        "",
+        "### Validator leaderboard",
+        _md_table(scored["validator_board"]),
+        "",
+        f"**Total Gemini spend: ${spent_usd:.2f}** of the ${cap_usd:.2f} cap.",
+    ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- notebook steps
+
+
+def load_complaints(cfg: Config, source: str, params) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Staged `load_clean`: (complaints, filter_report); the report is stored beside it."""
+
+    def fn() -> pd.DataFrame:
+        df, report = load_clean(source, params)
+        store.write(cfg, STAGE_FILTER_REPORT, report)
+        return df
+
+    complaints = store.stage(cfg, P.STAGE_COMPLAINTS, fn)
+    return complaints, store.read(cfg, STAGE_FILTER_REPORT)
+
+
+def split_summary(complaints: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame:
+    """Rows per Product x split (train / tuning / test) plus a total row."""
+    m = splits.merge(complaints[["complaint_id", "product"]], on="complaint_id")
+    t = m.pivot_table(
+        index="product", columns="split", values="complaint_id", aggfunc="count", fill_value=0
+    )
+    t["total"] = t.sum(axis=1)
+    t.loc["ALL"] = t.sum()
+    return t.astype(int)
+
+
+def run_classic(cfg: Config, name: str, make, train_df: pd.DataFrame, eval_df: pd.DataFrame):
+    """Fit-or-load one non-LLM classifier; stage its predictions and probabilities."""
+    if store.exists(cfg, P.stage_pred(name)) and store.exists(cfg, P.stage_probs(name)):
+        return store.read(cfg, P.stage_pred(name))
+    pred, probs = P.fit_predict_classifier(
+        cfg, make(), train_df, eval_df[["complaint_id", "narrative"]], name
+    )
+    store.write(cfg, P.stage_pred(name), pred)
+    store.write(cfg, P.stage_probs(name), probs)
+    return pred
+
+
+def compare_runs(
+    runs: dict[str, Callable[[], pd.DataFrame]], truth: pd.DataFrame, ledger: Ledger
+) -> pd.DataFrame:
+    """Run each paid classification, report accuracy per level and the real $ (ledger delta)."""
+    rows = []
+    for name, fn in runs.items():
+        before = ledger.spent()
+        try:
+            pred = fn()
+        except DailyQuotaExhausted as e:
+            raise StageIncomplete(
+                f"The daily Gemini request quota is used up during '{name}' "
+                f"({e.remaining_rows} rows left). Finished rows are saved - rerun this cell "
+                "tomorrow."
+            ) from None
+        except BudgetExceeded as e:
+            raise StageIncomplete(f"Budget reached during '{name}' ({e}).") from None
+        acc = accuracy_by_level(pred, truth)
+        rows.append(
+            {"run": name, "rows_done": len(pred), "of": len(truth), **acc,
+             "usd": ledger.spent() - before}
+        )  # fmt: skip
+    return pd.DataFrame(rows)
+
+
+def phase_estimate(
+    cfg: Config,
+    ledger: Ledger,
+    taxonomy: pd.DataFrame,
+    test_df: pd.DataFrame,
+    sc_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """Estimated $ per remaining paid step (judge steps use the classification estimate)."""
+    judge = cfg.judge_model
+    steps = [
+        (P.STAGE_PRED_GEMINI, "Test classification",
+         estimate_classification(cfg, test_df, taxonomy)),
+        (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2",
+         estimate_classification(cfg, sc_rows, taxonomy)),
+        (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3",
+         estimate_classification(cfg, sc_rows, taxonomy)),
+        (P.STAGE_JEB, "JEB judge, full test",
+         estimate_classification(cfg, test_df, taxonomy, model=judge)),
+        (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows",
+         estimate_classification(cfg, test_df.head(cfg.hand_check_n), taxonomy, model=judge)),
+    ]  # fmt: skip
+    df = pd.DataFrame(steps, columns=["stage", "step", "usd"])
+    df["done"] = [store.exists(cfg, st) for st in df["stage"]]
+    pend = float(df.loc[~df["done"], "usd"].sum())
+    print(df.assign(usd=df["usd"].map("${:.2f}".format)).to_string(index=False))
+    print(f"Still to spend (upper estimate): ${pend:.2f}; {ledger_report(ledger)}")
+    return df
+
+
+def pending_usd(est: pd.DataFrame, stages: Iterable[str]) -> float:
+    sel = est[est["stage"].isin(list(stages)) & ~est["done"]]
+    return float(sel["usd"].sum())
+
+
+def load_human_review(cfg: Config, gc, url: str, allow_partial: bool = False) -> pd.DataFrame:
+    """Read the verdicts from the review sheet, print progress, store as Parquet."""
+    human = read_review_sheet(gc, url)
+    counts = count_verdicts(human)
+    print(counts.to_string(index=False))
+    blank_summary = int(((human["summary_ok"] == "") & (human["level"] == "product")).sum())
+    n_blank = int(counts["n_blank"].sum())
+    print(f"Blank verdict cells: {n_blank}; blank summary_ok cells: {blank_summary}")
+    if n_blank and not allow_partial:
+        raise StageIncomplete(
+            f"{n_blank} verdict cells in the review sheet are still blank. Fill them in "
+            "(use 'ambiguous' if you cannot tell), or set ALLOW_PARTIAL = True to score "
+            "only what is filled in."
+        )
+    store.write(cfg, P.STAGE_HUMAN_REVIEW, human)
+    return human
+
+
+def show_results(cfg: Config, scored: dict, ledger: Ledger) -> str:
+    """Save results.md next to the Parquet tables and display it as Markdown."""
+    text = results_markdown(scored, ledger.spent(), ledger.cap_usd)
+    (Path(cfg.artifacts_dir) / "results.md").write_text(text, encoding="utf-8")
+    try:
+        from IPython.display import Markdown, display
+
+        display(Markdown(text))
+    except ImportError:
+        print(text)
+    return text
+
+
+def list_outputs(cfg: Config) -> list[str]:
+    names = sorted(p.name for p in Path(cfg.artifacts_dir).glob("*.parquet"))
+    print(f"{len(names)} Parquet tables in {cfg.artifacts_dir}:")
+    print("  " + ", ".join(names))
+    return names
