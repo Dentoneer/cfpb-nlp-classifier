@@ -114,10 +114,9 @@ def _load_clean(
         ),
         (
             "no_sub_issue",
-            """
+            r"""
             SELECT * FROM {prev}
-            WHERE sub_issue IS NOT NULL AND trim(sub_issue, ' 	
-') <> ''""",
+            WHERE sub_issue IS NOT NULL AND regexp_matches(sub_issue, '\S')""",
         ),
         (
             "rare_paths",
