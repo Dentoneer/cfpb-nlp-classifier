@@ -7,18 +7,20 @@ import math
 import time
 import uuid
 from collections.abc import Callable
+from typing import TypeVar
 
 import pandas as pd
 
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.config import Config
 from nlp.data import clean_text
-from nlp.llm.client import GeminiClient, RateLimited
+from nlp.llm.client import GeminiClient, RateLimited, ServiceUnavailable
 from nlp.schema import PREDICTIONS_COLS
 from nlp.sheets import taxonomy_snapshot_hash
 from nlp.store import JsonlCache
 from nlp.taxonomy import normalize_path, taxonomy_prompt_text
 
+T = TypeVar("T")
 _STR = {"type": "string"}
 RESPONSE_SCHEMA: dict = {
     "type": "array",
@@ -37,7 +39,8 @@ RESPONSE_SCHEMA: dict = {
 }
 
 MAX_RETRIES = 2  # re-queues per row after the first attempt
-MAX_RATE_LIMIT_ATTEMPTS = 5
+MAX_RATE_LIMIT_ATTEMPTS = 5  # per request, for 429s and 5xx / timeouts alike
+RESERVE_SAFETY = 1.5  # multiplier on the chars/4 input-token guess
 _PARSED_COLS = [
     "complaint_id", "product", "issue", "sub_issue", "summary", "confidence"
 ]  # fmt: skip
@@ -67,9 +70,9 @@ def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -
 
 
 def estimate_request_tokens(system: str, user: str, n_rows: int, thinking: str) -> tuple[int, int]:
-    """Conservative (est_in, est_out) for Ledger.reserve."""
+    """Conservative (est_in, est_out) for Ledger.reserve (est_out is also max_output_tokens)."""
     allowance = {"none": 0, "minimal": 0, "low": 512}.get(thinking, 2048)
-    est_in = (len(system) + len(user)) // 4
+    est_in = int((len(system) + len(user)) / 4 * RESERVE_SAFETY)
     est_out = int(n_rows * (150 + allowance) * 1.5)
     return est_in, est_out
 
@@ -146,16 +149,40 @@ def _generate_with_backoff(
     est: tuple[int, int],
     args: tuple,
 ):
-    """reserve -> limiter.wait -> generate, retrying non-daily 429s with exponential backoff."""
-    for attempt in range(MAX_RATE_LIMIT_ATTEMPTS):
+    """reserve -> limiter.wait -> generate, with bounded exponential backoff.
+
+    Retried: non-daily 429s and ServiceUnavailable (5xx / timeouts; nothing is billed).
+    """
+
+    def attempt():
         ledger.reserve(model, *est)
         limiter.wait()
+        return client.generate(model, *args)
+
+    return with_backoff(attempt, sleep, "Gemini")
+
+
+def with_backoff(call: Callable[[], T], sleep: Callable[[float], None], provider: str) -> T:
+    """Run `call` up to MAX_RATE_LIMIT_ATTEMPTS times, sleeping max(retry_after, 2*2**n).
+
+    A daily 429 is re-raised at once; a non-daily 429 after the last attempt is re-raised; a
+    ServiceUnavailable after the last attempt is re-raised with a plain-English message.
+    """
+    for attempt in range(MAX_RATE_LIMIT_ATTEMPTS):
         try:
-            return client.generate(model, *args)
+            return call()
         except RateLimited as e:
             if e.daily or attempt == MAX_RATE_LIMIT_ATTEMPTS - 1:
                 raise
             sleep(max(e.retry_after or 0.0, 2.0 * 2**attempt))
+        except ServiceUnavailable as e:
+            if attempt == MAX_RATE_LIMIT_ATTEMPTS - 1:
+                raise ServiceUnavailable(
+                    f"{provider} is overloaded or not answering ({e}); gave up after "
+                    f"{MAX_RATE_LIMIT_ATTEMPTS} attempts; nothing was charged for them."
+                ) from e
+            sleep(2.0 * 2**attempt)
+    raise AssertionError("unreachable")
 
 
 def run_queue(
@@ -177,7 +204,9 @@ def run_queue(
     Per request: reserve -> limiter.wait -> generate(max_output_tokens=est_out) ->
     ledger.record (estimate if usage is missing) -> `handle` (parses, caches, returns ids to
     retry). Rows are re-queued up to MAX_RETRIES times; returns the ids that never validated.
-    On budget exhaustion stops early; a daily quota 429 raises DailyQuotaExhausted.
+    When the cap refuses a request, raises BudgetExceeded (naming the rows remaining) after
+    every finished row is cached, so callers can never mistake a budget stop for a finished
+    run; a daily quota 429 raises DailyQuotaExhausted.
     """
     attempts: dict[str, int] = {}
     failed: set[str] = set()
@@ -190,9 +219,8 @@ def run_queue(
                 client, limiter, sleep, ledger, model, est,
                 (system, user, schema, thinking, est[1]),
             )  # fmt: skip
-        except BudgetExceeded as e:
-            print(f"Budget cap reached ({e}); {len(batch_ids) + len(queue)} rows remaining.")
-            break
+        except BudgetExceeded as e:  # everything finished so far is already cached
+            raise BudgetExceeded(f"{e}; {len(batch_ids) + len(queue)} rows remaining") from e
         except RateLimited as e:
             if e.daily:  # everything finished so far is already cached
                 raise DailyQuotaExhausted(len(batch_ids) + len(queue)) from e
@@ -229,8 +257,9 @@ def run_classification(
     """Classify `rows` (complaint_id, narrative) sequentially; resumable via `cache`.
 
     Per request: reserve -> limiter.wait -> generate -> ledger.record -> cache.put per row.
-    Returns every cached prediction for `rows`. On budget exhaustion stops and returns what
-    is done; on a daily quota 429 raises DailyQuotaExhausted(remaining_rows).
+    Returns every cached prediction for `rows`. When the cap stops the run, raises
+    BudgetExceeded (finished rows stay cached); on a daily quota 429 raises
+    DailyQuotaExhausted(remaining_rows).
     """
     model = model or cfg.classifier_model
     prompt_version = prompt_version or cfg.prompt_version

@@ -305,23 +305,24 @@ def test_apply_choices_is_rerun_safe(tmp_path, capsys):
 def test_stage_paid_tolerates_two_percent_but_not_budget(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     ids = [f"c{i}" for i in range(100)]
-    ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
-    one_short = pd.DataFrame({"complaint_id": ids[:99]})
     two_short = pd.DataFrame({"complaint_id": ids[:98]})
     three_short = pd.DataFrame({"complaint_id": ids[:97]})
     # >2% missing: not saved
     with pytest.raises(colab.StageIncomplete, match="97 of 100"):
-        colab.stage_paid(cfg, "a", lambda: three_short, ids, ledger)
+        colab.stage_paid(cfg, "a", lambda: three_short, ids)
     assert not store.exists(cfg, "a")
     # <=2% missing and budget fine: saved, ids printed
-    out = colab.stage_paid(cfg, "a", lambda: two_short, ids, ledger)
+    out = colab.stage_paid(cfg, "a", lambda: two_short, ids)
     assert len(out) == 98 and store.exists(cfg, "a")
     printed = capsys.readouterr().out
     assert "c98" in printed and "c99" in printed and "2 of 100" in printed
-    # budget exhausted: even 1 missing row is not saved
-    ledger.record("gemini-2.5-flash", "r", 0, 1_600_000)  # $4.00 spent
-    with pytest.raises(colab.StageIncomplete, match="99 of 100"):
-        colab.stage_paid(cfg, "b", lambda: one_short, ids, ledger)
+
+    # budget stop (explicit BudgetExceeded from the runner): nothing saved
+    def budget_stop():  # runner finished 99 rows, then the cap stopped it
+        raise BudgetExceeded("cap; 1 rows remaining")
+
+    with pytest.raises(colab.StageIncomplete, match="Budget reached"):
+        colab.stage_paid(cfg, "b", budget_stop, ids)
     assert not store.exists(cfg, "b")
 
 
@@ -411,3 +412,112 @@ def test_read_secrets_jev_key_is_optional(capsys):
     assert "notebook 04" in capsys.readouterr().out
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         colab.read_secrets(UD({"TYPESAFE_API_KEY": "t"}))
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_stage_paid_budget_stop_with_money_left_is_not_saved(tmp_path):
+    """Large reserve estimate, >$0.10 still under the cap: the explicit signal blocks the save."""
+    import dataclasses
+
+    from nlp import pipeline as P
+    from nlp.budget import RateLimiter
+    from nlp.llm.client import FakeClient, LLMResponse
+
+    tax = build_taxonomy(_tax_rows())
+    rows = pd.DataFrame({"complaint_id": [f"c{i}" for i in range(4)],
+                         "narrative": ["text " * 50] * 4})  # fmt: skip
+    cfg = dataclasses.replace(_cfg(tmp_path), batch_size=2, thinking="high")
+    t = tax.iloc[0]
+
+    def answer(model, system, user, schema, thinking):
+        import re
+
+        ids = re.findall(r"complaint_id: (\S+)", user)
+        return LLMResponse(json.dumps([
+            {"complaint_id": i, "product": t["product"], "issue": t["issue"],
+             "sub_issue": t["sub_issue"], "summary": "s", "confidence": 0.9} for i in ids
+        ]), 10, 3000)  # fmt: skip
+
+    ledger = Ledger(tmp_path / "l.jsonl", 0.40, {"g": (1.0, 50.0)})  # reserve ~$0.33/batch
+    client = FakeClient(answer)
+    limiter = RateLimiter(10_000, sleep=lambda s: None)
+    with pytest.raises(colab.StageIncomplete, match="Budget reached") as e:
+        colab.stage_paid(cfg, "pred", lambda: P.run_gemini(
+            dataclasses.replace(cfg, classifier_model="g"), rows, client, ledger,
+            store.JsonlCache(tmp_path / "c.jsonl"), tax, "gemini", limiter), rows["complaint_id"])
+    assert "Nothing more was spent" in str(e.value)
+    assert len(client.calls) == 1  # first batch paid, second batch refused by the reserve
+    assert ledger.cap_usd - ledger.spent() > 0.10
+    assert not store.exists(cfg, "pred")
+
+
+def test_stage_paid_and_compare_runs_translate_service_unavailable(tmp_path):
+    from nlp.llm.client import ServiceUnavailable
+
+    cfg = _cfg(tmp_path)
+
+    def down():
+        raise ServiceUnavailable("overloaded after 5 attempts")
+
+    with pytest.raises(colab.StageIncomplete, match="later"):
+        colab.stage_paid(cfg, "s", down, ["a"])
+    assert not store.exists(cfg, "s")
+    with pytest.raises(colab.StageIncomplete, match="later"):
+        colab.compare_runs({"x": down}, _tax_rows(), Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices))
+
+
+def test_results_markdown_has_summary_quality_section():
+    scored = {
+        "classifier_board": pd.DataFrame({"classifier": ["g"]}),
+        "validator_board": pd.DataFrame({"validator": ["v"]}),
+        "adjusted": pd.DataFrame({"level": ["product"], "value": [0.9]}),
+        "decision": {"go": True, "reasons": ["ok"]},
+        "summary_quality": pd.DataFrame(
+            {"measure": ["judge: faithful", "judge-human agreement"], "rate": [0.875, 0.5],
+             "n": [8, 4]}
+        ),
+    }
+    md = colab.results_markdown(scored, 0.5, 4.0)
+    assert "### Summary quality" in md and "judge: faithful" in md and "0.875" in md
+    del scored["summary_quality"]
+    assert "Summary quality" not in colab.results_markdown(scored, 0.5, 4.0)
+
+
+def test_load_complaints_uses_duckdb_temp_dir(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    seen = {}
+
+    def fake_load(source, params, temp_directory=None):
+        seen["tmp"] = temp_directory
+        return pd.DataFrame({"complaint_id": ["a"]}), pd.DataFrame({"step": ["nulls"]})
+
+    monkeypatch.setattr(colab, "load_clean", fake_load)
+    colab.load_complaints(cfg, "src", None)
+    assert seen["tmp"] == "/content/duckdb_tmp"
+
+
+def _nb_code(name: str) -> str:
+    from nlp.tools.check_notebooks import code_cells
+
+    return chr(10).join(code_cells(CONFIG.parent.parent / "notebooks" / name))
+
+
+def test_notebook_04_jev_expects_gemini_ids():
+    code = _nb_code("04_validators.ipynb")
+    jev_call = code[code.index("P.STAGE_JEV, lambda"):]
+    jev_call = jev_call[: jev_call.index("finally")]
+    assert 'gem["complaint_id"]' in jev_call and 'test_df["complaint_id"]' not in jev_call
+    assert "ids, ledger)" not in code and '"], ledger)' not in code  # no ledger arg any more
+
+
+def test_notebook_05_passes_summary_flags_and_weights():
+    code = _nb_code("05_results.ipynb")
+    assert "P.STAGE_SUMMARY_JUDGE" in code and "summary_flags=" in code
+    assert "weights=" in code and "P.review_weights(" in code
+
+
+def test_readme_warns_one_spender_at_a_time():
+    text = (CONFIG.parent.parent / "README.md").read_text(encoding="utf-8")
+    assert "one person and one notebook" in text.lower()

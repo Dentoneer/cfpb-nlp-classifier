@@ -24,6 +24,10 @@ class RateLimited(Exception):
         self.daily = daily
 
 
+class ServiceUnavailable(Exception):
+    """Provider overloaded (HTTP 5xx) or timed out. Nothing is billed; safe to retry later."""
+
+
 class GeminiClient(Protocol):
     def generate(
         self,
@@ -100,12 +104,18 @@ class GenAIClient:
             thinking_config=self._thinking_config(model, thinking),
             max_output_tokens=max_output_tokens,
         )
+        import httpx
+
         try:
             resp = self._client.models.generate_content(model=model, contents=user, config=cfg)
         except errors.ClientError as e:
             if e.code == 429:
                 raise self._rate_limited(e) from e
             raise
+        except errors.ServerError as e:  # 5xx, e.g. 503 "model is overloaded": not billed
+            raise ServiceUnavailable(f"Gemini HTTP {e.code}: {e.message}") from e
+        except httpx.TimeoutException as e:
+            raise ServiceUnavailable(f"Gemini request timed out: {e}") from e
         u = resp.usage_metadata
         if u is None or u.prompt_token_count is None or u.candidates_token_count is None:
             return LLMResponse(resp.text or "", None, None)

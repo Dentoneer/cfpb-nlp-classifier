@@ -21,8 +21,8 @@ import pandas as pd
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.config import Config
 from nlp.data import clean_text
-from nlp.llm.classify import MAX_RATE_LIMIT_ATTEMPTS
-from nlp.llm.client import RateLimited
+from nlp.llm.classify import with_backoff
+from nlp.llm.client import RateLimited, ServiceUnavailable
 from nlp.schema import VALIDATOR_RESULTS_COLS
 from nlp.store import JsonlCache
 
@@ -130,6 +130,8 @@ class HttpJevClient:
                 json={"model": model, "state": state, "questions": questions},
                 timeout=self.timeout,
             )
+        except httpx.TimeoutException as e:  # retried by the runner (bounded)
+            raise ServiceUnavailable(f"Jev request timed out: {e}") from e
         except httpx.HTTPError as e:
             raise JevError(f"Jev request failed: {e}") from e
         if r.status_code == 429:
@@ -139,6 +141,8 @@ class HttpJevClient:
             except ValueError:
                 retry_after = None
             raise RateLimited(retry_after, daily=False)
+        if r.status_code >= 500:  # overloaded / down: retried by the runner (bounded)
+            raise ServiceUnavailable(f"Jev HTTP {r.status_code}: {r.text[:200]}")
         if r.status_code >= 400:
             raise JevError(f"Jev HTTP {r.status_code}: {r.text}")
         try:
@@ -200,16 +204,23 @@ def estimate_jev_usd(cfg: Config, rows: pd.DataFrame, model: str | None = None) 
 
 
 def _call_with_backoff(client, limiter, sleep, ledger, model, est_in, state, questions):
-    """reserve -> limiter.wait -> system_one, retrying non-daily 429s with exponential backoff."""
-    for attempt in range(MAX_RATE_LIMIT_ATTEMPTS):
+    """reserve -> limiter.wait -> system_one; bounded backoff on 429s, 5xx and timeouts."""
+
+    def attempt():
         ledger.reserve(model, est_in, 0)
         limiter.wait()
-        try:
-            return client.system_one(model, state, questions)
-        except RateLimited as e:
-            if e.daily or attempt == MAX_RATE_LIMIT_ATTEMPTS - 1:
-                raise
-            sleep(max(e.retry_after or 0.0, 2.0 * 2**attempt))
+        return client.system_one(model, state, questions)
+
+    return with_backoff(attempt, sleep, "Jev")
+
+
+def _tokens(reported: object, estimate: int) -> int:
+    """Reported token count if it is a usable number, else the reserve estimate."""
+    if isinstance(reported, bool) or not isinstance(reported, (int, float)):
+        return estimate
+    if not math.isfinite(reported) or reported < 0:
+        return estimate
+    return int(reported)
 
 
 def run_jev(
@@ -228,8 +239,9 @@ def run_jev(
     Returns jev_results: complaint_id, product_ok, issue_ok, sub_issue_ok (noul P(yes); NaN if
     not asked),
     model_id - for every row with a fresh cached answer. A cached answer is stale (a miss)
-    if the judged labels differ from the row's current labels. On budget exhaustion stops and
-    returns what is done; a daily-quota 429 raises DailyQuotaExhausted(remaining_rows).
+    if the judged labels differ from the row's current labels. When the cap refuses a request,
+    raises BudgetExceeded (finished rows stay cached); a daily-quota 429 raises
+    DailyQuotaExhausted(remaining_rows).
     `taxonomy` decides whether an issue has sub-issues; when it has none and Gemini says
     "(none)", no sub-issue question is asked and sub_issue_ok is NaN for that row.
     """
@@ -271,18 +283,17 @@ def run_jev(
             resp = _call_with_backoff(
                 client, limiter, sleep, ledger, model, est_in, state, questions
             )
-        except BudgetExceeded as e:
-            print(f"Budget cap reached ({e}); {len(queue) - i} rows remaining.")
-            break
+        except BudgetExceeded as e:  # everything finished so far is already cached
+            raise BudgetExceeded(f"{e}; {len(queue) - i} rows remaining") from e
         except RateLimited as e:
             if e.daily:  # everything finished so far is already cached
                 raise DailyQuotaExhausted(len(queue) - i) from e
             raise
         except JevParseError as e:  # the call was paid even though we cannot read it
-            ledger.record(model, uuid.uuid4().hex, e.input_tokens or est_in, 0)
+            ledger.record(model, uuid.uuid4().hex, _tokens(e.input_tokens, est_in), 0)
             raise
         # Ledger first: a crash after a paid response must never lose the charge.
-        in_tok = est_in if resp.input_tokens is None else resp.input_tokens
+        in_tok = _tokens(resp.input_tokens, est_in)  # odd usage never blocks recording
         ledger.record(model, uuid.uuid4().hex, in_tok, 0)  # output tokens are free
         missing = [f for f in questions if f not in resp.nouls]
         if missing:

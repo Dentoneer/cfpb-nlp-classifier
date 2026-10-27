@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -35,29 +36,55 @@ def _quote(source: str) -> str:
     return "'" + source.replace("'", "''") + "'"
 
 
-def load_clean(source: str, params: FilterParams) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (complaints frame, filter_report frame) after the six noise filters."""
+def load_clean(
+    source: str, params: FilterParams, temp_directory: str | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (complaints frame, filter_report frame) after the six noise filters.
+
+    Memory-safe for the full 16M-row mirror on a Colab VM: the null and window filters run
+    inside the source scan (their report counts come from one aggregate, nothing is copied),
+    each step table is dropped once the next one exists, and DuckDB may spill to
+    `temp_directory` when given.
+    """
     con = _connect()
-    src = _quote(source)
+    try:
+        return _load_clean(con, _quote(source), params, temp_directory)
+    finally:
+        con.close()
+
+
+_SOURCE_COLS = """complaint_id, CAST(date_received AS DATE) AS date_received, product, issue,
+               sub_issue, consumer_complaint_narrative AS narrative, company, state"""
+_NOT_NULL = """consumer_complaint_narrative IS NOT NULL AND product IS NOT NULL
+               AND issue IS NOT NULL"""
+_IN_WINDOW = """CAST(date_received AS DATE) >= CAST($start AS DATE)
+               AND CAST(date_received AS DATE) < CAST($end AS DATE)"""
+
+
+def _load_clean(
+    con: duckdb.DuckDBPyConnection, src: str, params: FilterParams, temp_directory: str | None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    con.execute("SET preserve_insertion_order = false")
+    if temp_directory:
+        Path(temp_directory).mkdir(parents=True, exist_ok=True)
+        con.execute(f"SET temp_directory = {_quote(str(temp_directory))}")
+    window = {"start": params.start, "end": params.end}
+    total, not_null, kept = con.execute(
+        f"""SELECT count(*), count(*) FILTER (WHERE {_NOT_NULL}),
+                   count(*) FILTER (WHERE {_NOT_NULL} AND {_IN_WINDOW})
+            FROM read_parquet({src})""",
+        window,
+    ).fetchone()
+    report = [
+        ("nulls", total, total - not_null, not_null),
+        ("window", not_null, not_null - kept, kept),
+    ]
     con.execute(
-        f"""
-        CREATE TEMP TABLE s0 AS
-        SELECT complaint_id, CAST(date_received AS DATE) AS date_received, product, issue,
-               sub_issue, consumer_complaint_narrative AS narrative, company, state
-        FROM read_parquet({src})
-        """
+        f"""CREATE TEMP TABLE s0 AS SELECT {_SOURCE_COLS} FROM read_parquet({src})
+            WHERE {_NOT_NULL} AND {_IN_WINDOW}""",
+        window,
     )
     steps: list[tuple[str, str]] = [
-        (
-            "nulls",
-            """SELECT * FROM {prev}
-               WHERE narrative IS NOT NULL AND product IS NOT NULL AND issue IS NOT NULL""",
-        ),
-        (
-            "window",
-            """SELECT * FROM {prev} WHERE date_received >= CAST($start AS DATE)
-               AND date_received < CAST($end AS DATE)""",
-        ),
         (
             "templates",
             r"""
@@ -105,28 +132,22 @@ def load_clean(source: str, params: FilterParams) -> tuple[pd.DataFrame, pd.Data
         ),
     ]
     binds = {
-        "start": params.start,
-        "end": params.end,
         "copies": params.template_min_copies,
         "min_chars": params.min_chars,
         "max_x": params.max_x_frac,
         "req_frac": params.sub_issue_required_frac,
         "min_rows": params.min_path_rows,
     }
-    report = []
-    prev = "s0"
+    prev, before = "s0", kept
     for i, (name, sql) in enumerate(steps, start=1):
         cur = f"s{i}"
         used = {k: v for k, v in binds.items() if f"${k}" in sql}
         con.execute(f"CREATE TEMP TABLE {cur} AS {sql.format(prev=prev)}", used)
-        before = con.execute(f"SELECT count(*) FROM {prev}").fetchone()[0]
+        con.execute(f"DROP TABLE {prev}")
         after = con.execute(f"SELECT count(*) FROM {cur}").fetchone()[0]
         report.append((name, before, before - after, after))
-        prev = cur
-    df = con.execute(
-        f"SELECT * FROM {prev} ORDER BY date_received, complaint_id"
-    ).df()
-    con.close()
+        prev, before = cur, after
+    df = con.execute(f"SELECT * FROM {prev} ORDER BY date_received, complaint_id").df()
     return df, pd.DataFrame(report, columns=REPORT_COLS)
 
 

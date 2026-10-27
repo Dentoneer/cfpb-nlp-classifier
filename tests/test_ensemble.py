@@ -109,3 +109,22 @@ def test_row_status_rules():
     assert row_status(gem, cfpb, ens, threshold=0.5).set_index("complaint_id")["status"]["c"] == (
         "likely_correct"
     )
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_learned_ensemble_uses_sample_weights():
+    results, hand = _learned_inputs()
+    w = pd.Series(np.linspace(0.5, 3.0, len(hand)), index=hand.complaint_id)
+    out = ensemble_learned(results, hand, n_splits=5, sample_weight=w)
+    piv = results.pivot(index="complaint_id", columns="validator", values="score")
+    y = hand.set_index("complaint_id")["correct"]
+    hand_ids = list(hand.complaint_id)
+    m = LogisticRegression(max_iter=1000).fit(
+        piv.loc[hand_ids], y.loc[hand_ids], sample_weight=w.loc[hand_ids].to_numpy()
+    )
+    rest = out[~out.complaint_id.isin(hand_ids)].set_index("complaint_id")
+    assert rest["score"].to_numpy() == pytest.approx(m.predict_proba(piv.loc[rest.index])[:, 1])
+    unweighted = ensemble_learned(results, hand, n_splits=5)
+    assert not np.allclose(unweighted["score"], out["score"])

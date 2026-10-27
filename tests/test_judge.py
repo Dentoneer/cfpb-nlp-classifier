@@ -86,3 +86,16 @@ def test_summary_changed_is_rejudged(cfg, tmp_path):
     r.loc[2, "summary"] = "new summary"
     judge_summaries(r, cfg, client, ledger, cache, limiter=limiter)
     assert len(client.calls) == n + 1
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_judge_budget_stop_is_explicit(cfg, tmp_path):
+    from nlp.budget import BudgetExceeded
+
+    client, _, cache, limiter = make(tmp_path, lambda *a: LLMResponse("[]", 1, 1))
+    tiny = Ledger(tmp_path / "tiny.jsonl", 0.0, PRICES)
+    with pytest.raises(BudgetExceeded):
+        judge_summaries(rows(), cfg, client, tiny, cache, limiter=limiter)
+    assert client.calls == []

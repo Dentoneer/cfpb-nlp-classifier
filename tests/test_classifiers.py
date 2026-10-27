@@ -183,3 +183,24 @@ def test_modernbert_fits_toy():
     clf.fit(TEXTS, LABELS)
     _, p = clf.predict_proba(TEXTS[:2])
     assert p.shape == (2, 3)
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_model_dir_changes_when_training_rows_change(tmp_path):
+    from nlp.classifiers.base import model_dir
+
+    cfg = _cfg(tmp_path)
+    df = pd.DataFrame({"complaint_id": range(10), "narrative": TEXTS, "path_id": LABELS})
+    same = df.sample(frac=1.0, random_state=0)  # row order must not matter
+    other_rows = df.assign(complaint_id=range(100, 110))
+    other_labels = df.assign(path_id=[A] * 5 + [B] * 3 + [C] * 2)
+    clf = TfidfLR()
+    d = model_dir(cfg, clf, df)
+    assert model_dir(cfg, clf, same) == d
+    assert model_dir(cfg, clf, other_rows) != d
+    assert model_dir(cfg, clf, other_labels) != d
+    fit_or_load(cfg, TfidfLR(), df)
+    fit_or_load(cfg, TfidfLR(), other_rows)  # new split: refit, not a stale reuse
+    assert len(list((tmp_path / "models").glob("tfidf_lr-*"))) == 2

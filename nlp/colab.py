@@ -21,6 +21,7 @@ from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter,
 from nlp.config import Config
 from nlp.data import clean_text, load_clean
 from nlp.llm.classify import build_prompt, estimate_request_tokens
+from nlp.llm.client import ServiceUnavailable
 from nlp.llm.jev import estimate_jev_usd
 from nlp.review import count_verdicts
 from nlp.sheets import read_review_sheet
@@ -33,7 +34,7 @@ LEVELS4 = ["product", "issue", "sub_issue", "path"]
 STAGE_FILTER_REPORT = "filter_report"
 ALLOWED_OVERRIDES = ("classifier_model", "judge_model", "batch_size", "thinking")
 MAX_MISSING_FRAC = 0.02  # stage_paid saves a stage missing at most this share of rows
-BUDGET_FLOOR_USD = 0.10  # less than this left under the cap counts as "budget reached"
+DUCKDB_TMP = "/content/duckdb_tmp"  # local Colab disk DuckDB may spill to while filtering
 MEASURED_SAFETY = 1.5
 RESTART_MSG = "Restart session (Runtime menu \u2192 Restart session), then rerun this cell"
 
@@ -197,13 +198,13 @@ def stage_paid(
     name: str,
     fn: Callable[[], pd.DataFrame],
     expected_ids: Iterable[str],
-    ledger: Ledger | None = None,
 ) -> pd.DataFrame:
-    """`store.stage` for Gemini steps: saves only a (nearly) complete result.
+    """`store.stage` for paid (Gemini / Jev) steps: saves only a (nearly) complete result.
 
-    A shortfall caused by budget (under $0.10 left under the cap) or more than 2% of rows
-    missing is not saved - rerun later. Up to 2% missing for other reasons (rows Gemini
-    keeps answering invalidly) is saved and the missing ids are printed.
+    A run stopped by the budget cap (the runners raise BudgetExceeded), the daily quota or a
+    provider outage is never saved, nor is a result missing more than 2% of rows - rerun
+    later. Up to 2% missing for other reasons (rows Gemini keeps answering invalidly) is saved
+    and the missing ids are printed.
 
     Paid responses are already in the JSONL cache, so rerunning the cell later only pays for
     the rows still missing.
@@ -219,18 +220,20 @@ def stage_paid(
             "Everything finished is saved - rerun this cell tomorrow."
         ) from None
     except BudgetExceeded as e:
-        raise StageIncomplete(f"Budget reached ({e}). Nothing more was spent.") from None
+        raise StageIncomplete(
+            f"Budget reached. Nothing more was spent. ({e}) Finished rows are saved."
+        ) from None
+    except ServiceUnavailable as e:
+        raise StageIncomplete(f"{e} Finished rows are saved - rerun this cell later.") from None
     got = set(df["complaint_id"].astype(str)) if len(df) else set()
     missing = sorted(want - got)
     if missing:
         frac = len(missing) / len(want)
-        budget_hit = ledger is not None and ledger.cap_usd - ledger.spent() < BUDGET_FLOOR_USD
-        if budget_hit or frac > MAX_MISSING_FRAC:
+        if frac > MAX_MISSING_FRAC:
             raise StageIncomplete(
-                f"{len(want) - len(missing)} of {len(want)} complaints done for '{name}'. "
-                "Either the budget cap was reached (see the ledger line below) or many rows "
-                "failed validation (see messages above). Finished rows are saved; rerun this "
-                "cell to retry the rest."
+                f"{len(want) - len(missing)} of {len(want)} complaints done for '{name}': "
+                "many rows failed validation (see messages above). Finished rows are saved; "
+                "rerun this cell to retry the rest."
             )
         print(
             f"{len(missing)} of {len(want)} complaints ({frac:.1%}) got no valid answer after "
@@ -391,7 +394,8 @@ def _md_table(df: pd.DataFrame) -> str:
 
 
 def results_markdown(scored: dict, spent_usd: float, cap_usd: float) -> str:
-    """Markdown results summary: decision, adjusted accuracy, both leaderboards, spend."""
+    """Markdown results summary: decision, adjusted accuracy, leaderboards, summary quality
+    (when `scored` has it), spend."""
     d = scored["decision"]
     lines = [
         f"## Phase 1 result: {'GO' if d['go'] else 'NO-GO'}",
@@ -407,6 +411,14 @@ def results_markdown(scored: dict, spent_usd: float, cap_usd: float) -> str:
         "### Validator leaderboard",
         _md_table(scored["validator_board"]),
         "",
+    ]
+    if scored.get("summary_quality") is not None:
+        lines += [
+            "### Summary quality (judge on the hand-check rows, and your summary_ok answers)",
+            _md_table(scored["summary_quality"]),
+            "",
+        ]
+    lines += [
         f"**Total paid spend (Gemini + Jev): ${spent_usd:.2f}** of the ${cap_usd:.2f} cap.",
     ]
     return "\n".join(lines)
@@ -415,11 +427,13 @@ def results_markdown(scored: dict, spent_usd: float, cap_usd: float) -> str:
 # --------------------------------------------------------------------------- notebook steps
 
 
-def load_complaints(cfg: Config, source: str, params) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_complaints(
+    cfg: Config, source: str, params, temp_directory: str | None = DUCKDB_TMP
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Staged `load_clean`: (complaints, filter_report); the report is stored beside it."""
 
     def fn() -> pd.DataFrame:
-        df, report = load_clean(source, params)
+        df, report = load_clean(source, params, temp_directory=temp_directory)
         store.write(cfg, STAGE_FILTER_REPORT, report)
         return df
 
@@ -466,7 +480,13 @@ def compare_runs(
                 "tomorrow."
             ) from None
         except BudgetExceeded as e:
-            raise StageIncomplete(f"Budget reached during '{name}' ({e}).") from None
+            raise StageIncomplete(
+                f"Budget reached during '{name}'. Nothing more was spent. ({e})"
+            ) from None
+        except ServiceUnavailable as e:
+            raise StageIncomplete(
+                f"During '{name}': {e} Finished rows are saved - rerun this cell later."
+            ) from None
         acc = accuracy_by_level(pred, truth)
         rows.append(
             {"run": name, "rows_done": len(pred), "of": len(truth), **acc,

@@ -22,6 +22,8 @@ def test_smoke_end_to_end(tmp_path: Path):
     assert len(jev.calls) == 400 and {m for m, *_ in jev.calls} == {"jev-1.14.0"}  # 1 per test row
     assert set(out["adjusted"]) == {"product", "issue", "sub_issue", "path"}
     assert {m for m, *_ in client.calls} == {"gemini-2.5-flash", "gemini-3.1-flash-lite"}
+    assert "judge-human agreement" in out["summary_quality"]  # judge results are reported
+    assert 0.0 <= out["summary_quality"]["judge: faithful"] <= 1.0
 
     # Resume: everything is read back from Parquet / caches, zero new Gemini calls.
     before, jbefore = len(client.calls), len(jev.calls)

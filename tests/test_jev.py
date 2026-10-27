@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
-from nlp.llm.client import RateLimited
+from nlp.llm.client import RateLimited, ServiceUnavailable
 from nlp.llm.jev import (
     JEV_PROMPT_VERSION,
     FakeJevClient,
@@ -220,22 +220,25 @@ def test_missing_usage_records_estimate(cfg, tmp_path):
     assert ledger.spent() > 0
 
 
-def test_budget_stop_is_clean(cfg, tmp_path):
+def test_budget_stop_is_explicit(cfg, tmp_path):
     client, _, cache, limiter = make(tmp_path)
     tiny = Ledger(tmp_path / "tiny.jsonl", 1e-12, PRICES)
-    out = run_jev(rows(), cfg, client, tiny, cache, taxonomy=TAX, limiter=limiter)
-    assert out.empty and client.calls == []
-    assert list(out.columns) == ["complaint_id", "product_ok", "issue_ok", "sub_issue_ok", "model_id"]
-    assert BudgetExceeded  # same exception family as run_queue
+    with pytest.raises(BudgetExceeded, match="3 rows remaining"):
+        run_jev(rows(), cfg, client, tiny, cache, taxonomy=TAX, limiter=limiter)
+    assert client.calls == []
 
 
-def test_budget_stops_midway(cfg, tmp_path):
+def test_budget_stops_midway_after_caching(cfg, tmp_path):
     client, _, cache, limiter = make(tmp_path)
     one = 1000 * 0.042 / 1_000_000
     ledger = Ledger(tmp_path / "mid.jsonl", one * 2.05, PRICES)
-    out = run_jev(rows(), cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
-    assert len(client.calls) == 2 and len(out) == 2  # third would cross the cap
+    with pytest.raises(BudgetExceeded, match="1 rows remaining"):
+        run_jev(rows(), cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
+    assert len(client.calls) == 2  # third would cross the cap
     assert ledger.spent() <= ledger.cap_usd
+    out = run_jev(rows(), cfg, client, make(tmp_path / "x")[1], cache, taxonomy=TAX,
+                  limiter=limiter)  # fmt: skip
+    assert len(out) == 3 and len(client.calls) == 3  # rerun pays only for the missing row
 
 
 def test_429_backoff_honours_retry_after(cfg, tmp_path):
@@ -383,7 +386,7 @@ def test_http_client_request_and_errors(monkeypatch):
     with pytest.raises(JevError, match="401.*bad key"):
         c.system_one(MODEL, "s", q)
     monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp(503, text="down"))
-    with pytest.raises(JevError, match="503.*down"):
+    with pytest.raises(ServiceUnavailable, match="503.*down"):  # retried by the runner
         c.system_one(MODEL, "s", q)
 
 
@@ -398,3 +401,61 @@ def test_live_jev_call():
     assert set(r.nouls) == set(QIDS) and all(0 <= v <= 1 for v in r.nouls.values())
     assert r.nouls["product_ok"] > 0.5
     json.dumps(r.nouls)
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_jev_server_error_retried_then_succeeds(cfg, tmp_path):
+    attempts = []
+
+    def flaky(model, state, questions):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ServiceUnavailable("Jev HTTP 503")
+        return responder(model, state, questions)
+
+    client, ledger, cache, limiter = make(tmp_path, flaky)
+    sleeps = []
+    out = run_jev(rows(1), cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter,
+                  sleep=sleeps.append)  # fmt: skip
+    assert len(out) == 1 and len(attempts) == 2 and sleeps == [2.0]
+
+
+def test_jev_server_error_bounded(cfg, tmp_path):
+    def down(model, state, questions):
+        raise ServiceUnavailable("Jev HTTP 503")
+
+    client, ledger, cache, limiter = make(tmp_path, down)
+    with pytest.raises(ServiceUnavailable, match="5 attempts"):
+        run_jev(rows(1), cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter,
+                sleep=lambda s: None)  # fmt: skip
+    assert len(client.calls) == 5 and ledger.spent() == 0.0
+
+
+@pytest.mark.parametrize("kind", ["503", "timeout"])
+def test_http_jev_client_maps_5xx_and_timeouts(monkeypatch, kind):
+    import httpx
+
+    def post(*a, **k):
+        if kind == "timeout":
+            raise httpx.ReadTimeout("timed out")
+        return _Resp(503, text="overloaded")
+
+    monkeypatch.setattr(httpx, "post", post)
+    with pytest.raises(ServiceUnavailable):
+        HttpJevClient("key").system_one(MODEL, "s", build_jev_questions("P", "I", "S"))
+
+
+@pytest.mark.parametrize("bad", ["12", None, -5, float("nan"), True])
+def test_non_numeric_usage_falls_back_to_estimate(cfg, tmp_path, bad):
+    def weird(model, state, questions):
+        r = responder(model, state, questions)
+        r.input_tokens = bad
+        return r
+
+    client, ledger, cache, limiter = make(tmp_path, weird)
+    out = run_jev(rows(1), cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
+    assert len(out) == 1
+    rec = json.loads((tmp_path / "l.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert isinstance(rec["input_tokens"], int) and rec["input_tokens"] > 0

@@ -123,15 +123,34 @@ def oof_proba(
     return classes, out
 
 
-def model_dir(cfg: Config, clf: PathClassifier) -> Path:
-    """models/<name>-<8 hex of fingerprint>, so changed hyperparameters never reuse a model."""
+def training_data_hash(train_df: pd.DataFrame) -> str:
+    """Short hash of the sorted (complaint_id, narrative, path_id) training rows."""
+    ids = (
+        train_df["complaint_id"].astype(str)
+        if "complaint_id" in train_df
+        else pd.Series([""] * len(train_df), index=train_df.index)
+    )
+    rows = sorted(zip(ids, train_df["narrative"].astype(str), train_df["path_id"].astype(str)))
+    h = hashlib.sha1()
+    for row in rows:
+        h.update(json.dumps(row).encode() + b"\n")
+    return h.hexdigest()[:8]
+
+
+def model_dir(cfg: Config, clf: PathClassifier, train_df: pd.DataFrame | None = None) -> Path:
+    """models/<name>-<8 hex of fingerprint [+ training rows]>.
+
+    Changed hyperparameters or different training rows (e.g. new splits) never reuse a model.
+    """
     fp = json.dumps(clf.fingerprint(), sort_keys=True, default=str)
+    if train_df is not None:
+        fp += "|train=" + training_data_hash(train_df)
     return Path(cfg.artifacts_dir) / "models" / f"{clf.name}-{hashlib.sha1(fp.encode()).hexdigest()[:8]}"
 
 
 def fit_or_load(cfg: Config, clf: PathClassifier, train_df: pd.DataFrame) -> PathClassifier:
     """Fit on train_df (complaint_id, narrative, path_id) or load a persisted model."""
-    d = model_dir(cfg, clf)
+    d = model_dir(cfg, clf, train_df)
     texts, labels = train_df["narrative"].tolist(), train_df["path_id"].tolist()
     if hasattr(clf, "save_pretrained"):
         if (d / "meta.json").exists():

@@ -46,13 +46,16 @@ def ensemble_learned(
     human_labels: pd.DataFrame,
     n_splits: int = 5,
     level: str = "path",
+    sample_weight: pd.Series | None = None,
 ) -> pd.DataFrame:
     """`ensemble_learned`: logistic regression on the pivoted validator scores at `level`.
 
     `human_labels` = complaint_id, correct (bool: Gemini was right). Hand-checked rows get
     strictly out-of-fold scores (StratifiedKFold); all other rows are scored by a model fit on
     all hand-checked rows. The returned `fold` column is the fold a hand-checked row was held
-    out in, or -1 for rows scored by the full-fit model.
+    out in, or -1 for rows scored by the full-fit model. `sample_weight` (complaint_id ->
+    weight, e.g. the review's inverse-probability weights) weights each hand-checked row in
+    every fit; rows without a weight get 1.0. None fits unweighted.
     """
     X = _features(results, level)
     hl = human_labels.drop_duplicates("complaint_id").set_index("complaint_id")["correct"]
@@ -63,10 +66,18 @@ def ensemble_learned(
         raise ValueError("need at least 2 hand-checked rows of each class (right/wrong)")
     k = min(n_splits, minority)
 
-    def fit(idx) -> LogisticRegression:
-        return LogisticRegression(max_iter=1000).fit(X.loc[idx].to_numpy(), y_of(idx))
-
     ymap = dict(zip(hand, y))
+    wmap = (
+        None
+        if sample_weight is None
+        else sample_weight.groupby(level=0).first().reindex(hand).fillna(1.0).to_dict()
+    )
+
+    def fit(idx) -> LogisticRegression:
+        w = None if wmap is None else np.array([wmap[c] for c in idx], dtype=float)
+        return LogisticRegression(max_iter=1000).fit(
+            X.loc[idx].to_numpy(), y_of(idx), sample_weight=w
+        )
 
     def y_of(idx) -> np.ndarray:
         return np.array([ymap[c] for c in idx])

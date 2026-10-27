@@ -20,7 +20,7 @@ from nlp.llm.classify import run_classification
 from nlp.llm.client import GeminiClient
 from nlp.llm.jev import JevClient, v_jev
 from nlp.llm.jev import run_jev as _run_jev
-from nlp.llm.judge import judge_summaries
+from nlp.llm.judge import SUMMARY_FIELDS, judge_summaries
 from nlp.metrics import inverse_weights
 from nlp.review import agree_path, is_correct
 from nlp.schema import VALIDATOR_RESULTS_COLS, path_id
@@ -60,6 +60,7 @@ STAGE_ROW_STATUS = "row_status"
 STAGE_CLF_BOARD = "classifier_leaderboard"
 STAGE_ADJUSTED = "adjusted_accuracy"
 STAGE_VALIDATOR_BOARD = "validator_leaderboard"
+STAGE_SUMMARY_QUALITY = "summary_quality"
 
 
 def stage_pred(name: str) -> str:
@@ -152,15 +153,20 @@ def cleanlab_validator(
     make_tfidf: Callable[[], PathClassifier],
     n_splits: int = 5,
 ) -> pd.DataFrame:
-    """cleanlab validator rows: OOF probs on the train pool, TF-IDF probs on the test set."""
+    """cleanlab validator rows: OOF probs on the train pool, TF-IDF probs on the test set.
+
+    Only test complaints Gemini predicted are scored (a stage may miss up to 2% of rows).
+    """
+    g = gemini.drop_duplicates("complaint_id").set_index("complaint_id")
+    test_df = test_df[test_df["complaint_id"].isin(g.index)]
     test_ids = test_df["complaint_id"].tolist()
+    g = g.loc[test_ids]
     classes, oof = oof_proba(
         make_tfidf, train_df["narrative"].tolist(), train_df["path_id"].tolist(),
         n_splits=n_splits, seed=cfg.seed,
     )  # fmt: skip
     wide = tfidf_probs.pivot(index="complaint_id", columns="path_id", values="prob")
     test_probs = wide.reindex(index=test_ids, columns=classes).fillna(0.0).to_numpy()
-    g = gemini.drop_duplicates("complaint_id").set_index("complaint_id").loc[test_ids]
     return v_cleanlab(
         [path_id(*t) for t in zip(g["product"], g["issue"], g["sub_issue"])],
         classes, oof, train_df["path_id"].tolist(),
@@ -216,11 +222,15 @@ def human_labels(human_review: pd.DataFrame) -> pd.Series:
 
 
 def run_ensembles(
-    vres: pd.DataFrame, human_review: pd.DataFrame
+    vres: pd.DataFrame, human_review: pd.DataFrame, weights: pd.Series | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(ensemble_simple, ensemble_learned) from validator results and human verdicts."""
+    """(ensemble_simple, ensemble_learned) from validator results and human verdicts.
+
+    `weights` (see `review_weights`) reweight the hand-checked rows when fitting the learned
+    ensemble, so the over-sampled disagree stratum does not dominate it.
+    """
     labels = human_labels(human_review).reset_index()
-    return ensemble_simple(vres), ensemble_learned(vres, labels)
+    return ensemble_simple(vres), ensemble_learned(vres, labels, sample_weight=weights)
 
 
 def review_weights(
@@ -244,6 +254,41 @@ def all_validator_results(
     )
 
 
+def _summary_ok_by_complaint(human_review: pd.DataFrame) -> pd.Series:
+    """Marco's summary_ok per complaint ("yes"/"no"; blanks dropped)."""
+    s = human_review[["complaint_id", "summary_ok"]].copy()
+    s["summary_ok"] = s["summary_ok"].astype(str).str.strip().str.lower()
+    s = s[s["summary_ok"].isin(["yes", "no"])]
+    return s.drop_duplicates("complaint_id").set_index("complaint_id")["summary_ok"]
+
+
+def summary_quality(summary_flags: pd.DataFrame, human_review: pd.DataFrame) -> pd.DataFrame:
+    """measure, rate, n: judge pass rates, Marco's summary_ok "yes" rate, judge-human agreement.
+
+    A summary passes the judge when it is faithful, covers the main issue and invents no details;
+    agreement compares that with Marco's yes/no on complaints that have both.
+    """
+    f = summary_flags.drop_duplicates("complaint_id").set_index("complaint_id")
+    fa, cov, inv = (f[c].astype(bool) for c in SUMMARY_FIELDS)
+    judge_ok = fa & cov & ~inv
+    human = _summary_ok_by_complaint(human_review)
+    both = judge_ok.index.intersection(human.index)
+    agree = judge_ok.loc[both] == (human.loc[both] == "yes")
+
+    def rate(x: pd.Series) -> float:
+        return float(x.mean()) if len(x) else float("nan")
+
+    rows = [
+        ("judge: faithful", rate(fa), len(fa)),
+        ("judge: covers main issue", rate(cov), len(cov)),
+        ("judge: no invented details", rate(~inv), len(inv)),
+        ("judge: all three OK", rate(judge_ok), len(judge_ok)),
+        ("Marco: summary OK (yes)", rate(human == "yes"), len(human)),
+        ("judge-human agreement", rate(agree), len(agree)),
+    ]
+    return pd.DataFrame(rows, columns=["measure", "rate", "n"])
+
+
 def run_scoring(
     cfg: Config,
     preds_all: pd.DataFrame,
@@ -256,8 +301,12 @@ def run_scoring(
     costs: dict[str, dict] | None = None,
     n_boot: int = 1000,
     stage: Callable[[str, Callable[[], pd.DataFrame]], pd.DataFrame] | None = None,
+    summary_flags: pd.DataFrame | None = None,
 ) -> dict:
-    """Boards + go/no-go. `stage(name, fn)` (e.g. a store.stage wrapper) makes boards resumable."""
+    """Boards + go/no-go. `stage(name, fn)` (e.g. a store.stage wrapper) makes boards resumable.
+
+    With `summary_flags` (the summary judge's output) the result also has `summary_quality`.
+    """
     st = stage or (lambda _name, fn: fn())
     clf_board = st(
         STAGE_CLF_BOARD, lambda: classifier_leaderboard(preds_all, complaints, test_ids)
@@ -272,9 +321,14 @@ def run_scoring(
         STAGE_VALIDATOR_BOARD,
         lambda: validator_leaderboard(validator_results, human_review, weights, costs or {}),
     )
-    return {
+    out = {
         "classifier_board": clf_board,
         "adjusted": adjusted,
         "validator_board": val_board,
         "decision": go_no_go(clf_board, adjusted),
     }
+    if summary_flags is not None:
+        out["summary_quality"] = st(
+            STAGE_SUMMARY_QUALITY, lambda: summary_quality(summary_flags, human_review)
+        )
+    return out

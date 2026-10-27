@@ -312,7 +312,8 @@ def run_smoke(
 
     def ensembles(i: int) -> pd.DataFrame:
         if not ens:
-            ens.extend(P.run_ensembles(vres, human))
+            weights = P.review_weights(gem, complaints, selection)
+            ens.extend(P.run_ensembles(vres, human, weights=weights))
         return ens[i]
 
     ens_simple = S(P.STAGE_ENSEMBLE_SIMPLE, lambda: ensembles(0))
@@ -323,7 +324,7 @@ def run_smoke(
     scored = P.run_scoring(
         cfg, pd.concat([gem, *preds.values()], ignore_index=True), complaints, test_ids, gem,
         human, selection, P.all_validator_results(vres, ens_simple, ens_learned),
-        n_boot=200, stage=S,
+        n_boot=200, stage=S, summary_flags=summary_flags,
     )  # fmt: skip
     clf_board, adjusted = scored["classifier_board"], scored["adjusted"]
     val_board = scored["validator_board"]
@@ -341,6 +342,7 @@ def run_smoke(
         "jev_path_catch_rate": float(jev_path["catch_rate"].iloc[0]),
         "status_counts": status["status"].value_counts().to_dict(),
         "summary_ok_share": float(summary_flags["faithful"].mean()),
+        "summary_quality": scored["summary_quality"].set_index("measure")["rate"].to_dict(),
         "spend_usd": ledger.spent(),
     }
 

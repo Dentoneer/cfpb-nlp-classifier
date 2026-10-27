@@ -175,3 +175,62 @@ def test_hf_source_reads_one_row():
 
     r = duckdb.sql(f"SELECT complaint_id FROM read_parquet('{HF_SOURCE}') LIMIT 1").fetchall()
     assert len(r) == 1
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+class _RecordingCon:
+    """Wraps a real DuckDB connection and records every statement and close()."""
+
+    def __init__(self, con, log):
+        self._con, self.log = con, log
+
+    def execute(self, sql, *args):
+        self.log.append(" ".join(str(sql).split()))
+        self._con.execute(sql, *args)
+        return self
+
+    def fetchone(self):
+        return self._con.fetchone()
+
+    def df(self):
+        return self._con.df()
+
+    def close(self):
+        self.log.append("CLOSE")
+        self._con.close()
+
+
+def _recording(monkeypatch, log):
+    from nlp import data
+
+    real = data._connect
+    monkeypatch.setattr(data, "_connect", lambda: _RecordingCon(real(), log))
+
+
+def test_load_clean_filters_at_source_and_frees_memory(tmp_path, monkeypatch):
+    log: list[str] = []
+    _recording(monkeypatch, log)
+    rows = [row() for _ in range(4)] + [row(consumer_complaint_narrative=None)]
+    rows += [row(date_received=pd.Timestamp("2020-01-01", tz="UTC"))]
+    tmp_dir = str(tmp_path / "duck_tmp")
+    df, rep = load_clean(write(tmp_path, rows), PARAMS, temp_directory=tmp_dir)
+    assert len(df) == 4 and list(rep["rows_removed"])[:2] == [1, 1]
+    assert any("preserve_insertion_order" in s and "false" in s.lower() for s in log)
+    assert any("temp_directory" in s and "duck_tmp" in s for s in log)
+    s0 = next(s for s in log if "CREATE TEMP TABLE s0" in s)
+    assert "WHERE" in s0 and "narrative IS NOT NULL" in s0.replace(
+        "consumer_complaint_narrative", "narrative"
+    )
+    # the source is never copied unfiltered; every earlier step table is dropped
+    assert sum(s.startswith("DROP TABLE") for s in log) == 4  # s0..s3; s4 is the result
+    assert log[-1] == "CLOSE"
+
+
+def test_load_clean_closes_connection_on_error(tmp_path, monkeypatch):
+    log: list[str] = []
+    _recording(monkeypatch, log)
+    with pytest.raises(Exception):  # noqa: B017 - any DuckDB IO error
+        load_clean(str(tmp_path / "missing.parquet"), PARAMS)
+    assert log[-1] == "CLOSE"

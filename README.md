@@ -41,6 +41,9 @@ on the Product level, to build the real thing?).
 > The notebooks download the code from the `main` branch on GitHub. Make sure the Phase 1 pull
 > request has been merged before you start.
 
+**Only one person and one notebook should spend money at a time.** The $4.00 cap is tracked in a
+ledger file on Drive, so two notebooks running paid cells at once could both see the same money left.
+
 ### Before you start (one time, about 30 minutes)
 
 1. **Google Cloud project for Gemini.** Marco creates a project (for example
@@ -126,6 +129,9 @@ decision. Free, a few minutes.
   Tell Claude what the ledger says; do not try to get around it.
 - **"daily request quota is used up" (or "daily Gemini request quota is used up").** Google limits how many requests you can send per day. Rerun the same
   cell tomorrow. Finished rows are cached, so you do not pay again.
+- **"... is overloaded or not answering ... rerun this cell later".** Gemini or Jev was busy and
+  the code gave up after a few tries. Nothing was charged for those tries. Wait 15-60 minutes and
+  rerun the same cell; finished rows are saved.
 - **"Restart session (Runtime menu > Restart session), then rerun this cell".** Do exactly that.
   The code on GitHub changed while your session was open. Saved results and choices on Drive are kept.
 - **Colab disconnected or timed out.** Reconnect, rerun the first (setup) cell, then the cell that

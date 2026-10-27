@@ -6,7 +6,7 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
-from nlp.budget import DailyQuotaExhausted, Ledger, RateLimiter
+from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.llm.classify import (
     RESPONSE_SCHEMA,
     build_prompt,
@@ -14,7 +14,7 @@ from nlp.llm.classify import (
     parse_and_validate,
     run_classification,
 )
-from nlp.llm.client import FakeClient, LLMResponse, RateLimited
+from nlp.llm.client import FakeClient, LLMResponse, RateLimited, ServiceUnavailable
 from nlp.schema import PREDICTIONS_COLS
 from nlp.sheets import taxonomy_snapshot_hash
 from nlp.store import JsonlCache
@@ -122,7 +122,7 @@ def test_parse_bad_confidence(taxonomy):
 
 def test_estimate_request_tokens():
     est_in, est_out = estimate_request_tokens("a" * 400, "b" * 400, 10, "none")
-    assert est_in == 200
+    assert est_in == 300  # chars/4 x 1.5 safety
     assert est_out == int(10 * 150 * 1.5)
     assert estimate_request_tokens("", "", 10, "low")[1] == int(10 * (150 + 512) * 1.5)
     assert estimate_request_tokens("", "", 10, "high")[1] == int(10 * (150 + 2048) * 1.5)
@@ -160,21 +160,24 @@ def test_cached_rows_not_resent_or_charged(tmp_path, cfg, taxonomy):
     assert len(second) == len(first)
 
 
-def test_budget_exhaustion_stops_cleanly(tmp_path, cfg, taxonomy, capsys):
-    # Each request records $0.0002 actual; the conservative reserve estimate (~$0.0033) is far
-    # larger, so this cap lets the first requests through and then stops without raising.
+def test_budget_exhaustion_raises_after_caching_finished_rows(tmp_path, cfg, taxonomy):
+    # Each request records $0.0002 actual; the conservative reserve estimate is far larger, so
+    # this cap lets the first requests through, then stops with an explicit BudgetExceeded.
     client, ledger, cache, limiter = make(tmp_path, good_responder(), cap=0.0036)
-    out = run(cfg, client, ledger, cache, limiter, taxonomy, n=9)
-    assert 0 < len(out) < 9
+    with pytest.raises(BudgetExceeded, match="remaining"):
+        run(cfg, client, ledger, cache, limiter, taxonomy, n=9)
+    assert 0 < len(client.calls) < 3
     assert ledger.spent() <= 0.0036
-    assert "remaining" in capsys.readouterr().out.lower()
+    done = run(cfg, client, Ledger(tmp_path / "big.jsonl", 4.0, PRICES), cache, limiter,
+               taxonomy, n=9)  # fmt: skip
+    assert len(done) == 9  # finished rows were cached; the rerun completes the rest
 
 
-def test_budget_exhausted_at_start_returns_empty(tmp_path, cfg, taxonomy):
+def test_budget_exhausted_at_start_raises(tmp_path, cfg, taxonomy):
     client, ledger, cache, limiter = make(tmp_path, good_responder(), cap=0.0)
-    out = run(cfg, client, ledger, cache, limiter, taxonomy)
-    assert out.empty and client.calls == []
-    assert list(out.columns) == PREDICTIONS_COLS
+    with pytest.raises(BudgetExceeded):
+        run(cfg, client, ledger, cache, limiter, taxonomy)
+    assert client.calls == []
 
 
 def test_daily_quota_raises_with_remaining(tmp_path, cfg, taxonomy):
@@ -309,3 +312,68 @@ def test_real_gemini_one_batch(tmp_path, tmp_cfg, taxonomy):
     paths = set(zip(taxonomy["product"], taxonomy["issue"], taxonomy["sub_issue"]))
     for _, x in out.iterrows():
         assert (x["product"], x["issue"], x["sub_issue"]) in paths
+
+
+# ---- final review fixes ------------------------------------------------------------------
+
+
+def test_server_error_retried_with_bounded_backoff(tmp_path, cfg, taxonomy):
+    good = good_responder()
+    fails = []
+
+    def flaky(model, system, user, schema, thinking):
+        if not fails:
+            fails.append(1)
+            raise ServiceUnavailable("503 overloaded")
+        return good(model, system, user, schema, thinking)
+
+    client, ledger, cache, limiter = make(tmp_path, flaky)
+    sleeps = []
+    out = run(cfg, client, ledger, cache, limiter, taxonomy, n=3, sleep=sleeps.append)
+    assert len(out) == 3 and len(client.calls) == 2 and sleeps == [2.0]
+
+
+def test_server_error_gives_up_with_clear_message(tmp_path, cfg, taxonomy):
+    def down(model, system, user, schema, thinking):
+        raise ServiceUnavailable("503 overloaded")
+
+    client, ledger, cache, limiter = make(tmp_path, down)
+    with pytest.raises(ServiceUnavailable, match="5 attempts") as e:
+        run(cfg, client, ledger, cache, limiter, taxonomy, n=3)
+    assert "nothing was charged" in str(e.value).lower()
+    assert len(client.calls) == 5 and ledger.spent() == 0.0
+
+
+def _genai_with(exc):
+    from types import SimpleNamespace
+
+    from nlp.llm.client import GenAIClient
+
+    def boom(**kw):
+        raise exc
+
+    c = GenAIClient.__new__(GenAIClient)
+    c._client = SimpleNamespace(models=SimpleNamespace(generate_content=boom))
+    c._quota_logged = False
+    return c
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")  # google-genai on 3.14
+@pytest.mark.parametrize("kind", ["server", "timeout"])
+def test_genai_client_maps_server_errors_and_timeouts(kind):
+    import httpx
+    from google.genai import errors
+
+    exc = (
+        errors.ServerError(503, {"error": {"code": 503, "message": "overloaded"}})
+        if kind == "server"
+        else httpx.ReadTimeout("timed out")
+    )
+    with pytest.raises(ServiceUnavailable):
+        _genai_with(exc).generate("gemini-2.5-flash", "s", "u", RESPONSE_SCHEMA, "low", 10)
+
+
+def test_reserve_estimate_has_input_safety_factor():
+    est_in, est_out = estimate_request_tokens("s" * 400, "u" * 400, 2, "low")
+    assert est_in == int(800 / 4 * 1.5)
+    assert est_out == int(2 * (150 + 512) * 1.5)
