@@ -13,8 +13,8 @@ way; notebooks 00-03 run without it (setup just prints a note).
 | 00 | `00_setup.ipynb` - checks Drive, key (free key check), Sheets | CPU | 3 min | $0 |
 | 01 | `01_data_and_splits.ipynb` - load, filter, taxonomy, splits | CPU | 5-15 min | $0 |
 | 02 | `02_baselines.ipynb` - TF-IDF, embeddings, kNN, ModernBERT | **GPU (T4)** | 45-90 min | $0 |
-| 03 | `03_gemini.ipynb` - Part 0 descriptions, bake-off, settings, tuning check, 800-row test run | CPU | 30-90 min | ~$1.8-2.1 |
-| 04 | `04_validators.ipynb` - judges, validators, review sheet | CPU | 30-60 min | ~$0.6-0.7 |
+| 03 | `03_gemini.ipynb` - Part 0 descriptions, bake-off, settings, tuning check, 800-row test run | CPU | 30-90 min | ~$2.2-3.5 (estimate) |
+| 04 | `04_validators.ipynb` - judges, validators, review sheet | CPU | 30-60 min | ~$0.6-1.0 (estimate) |
 | 05 | `05_results.ipynb` - ensembles, leaderboards, go/no-go | CPU | 5 min | $0 |
 
 Run them in order. After 04, **stop and fill in the review sheet** (link printed at the end of 04),
@@ -25,8 +25,9 @@ If a paid cell says the daily quota is exhausted, rerun that cell tomorrow; fini
 
 Notebook 03 order: **Part 0** writes a description of every category (needed before any
 classification), Parts A/B choose the model and settings (skip them if you picked on an earlier run;
-saved picks are kept), **Part C** checks the new prompt on the 200 tuning complaints against the old
-prompt's saved answers, the **Troubleshoot** cell is a free diagnostics printout, Part D is the test run.
+saved picks are kept), **Part C** checks the new prompt on the 200 tuning complaints against TF-IDF on
+the same complaints and projects the cost of the rest of the phase, the **Troubleshoot** cell is a free
+diagnostics printout, Part D is the test run. Costs are estimates; the in-code cap is the guard.
 
 The setup cell installs only this project (`[ml]` extra). Never pip-install or upgrade Google
 libraries in Colab: Colab's own `google-genai` (2.12.1) works, and upgrading it mid-session broke

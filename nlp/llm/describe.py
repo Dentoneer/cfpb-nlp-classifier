@@ -22,7 +22,7 @@ from nlp.config import Config
 from nlp.data import clean_text
 from nlp.errors import StageIncomplete
 from nlp.llm.classify import RESERVE_SAFETY, with_backoff
-from nlp.llm.client import GeminiClient, LLMResponse, RateLimited
+from nlp.llm.client import MAX_OUTPUT_TOKENS, GeminiClient, LLMResponse, RateLimited
 from nlp.schema import DESCRIPTIONS_COLS
 from nlp.store import JsonlCache
 from nlp.taxonomy import _norm
@@ -35,6 +35,7 @@ MAX_WORDS = 45
 DESCRIBE_THINKING = "low"
 MAX_ATTEMPTS = 2  # first try + one automatic retry per product
 MISSING_MSG = "Run Part 0 (descriptions) in notebook 03 first."
+DESCRIBE_TAG = f"describe:{DESCRIBE_VERSION}"  # ledger tag of description requests
 
 _STR = {"type": "string"}
 DESCRIBE_SCHEMA: dict = {
@@ -106,7 +107,7 @@ def estimate_describe_tokens(system: str, user: str, n_labels: int) -> tuple[int
     """Conservative (est_in, est_out); est_out is also max_output_tokens (generous, so the
     JSON is never cut off)."""
     est_in = int((len(system) + len(user)) / 4 * RESERVE_SAFETY)
-    est_out = n_labels * 300 + 4096
+    est_out = min(n_labels * 300 + 4096, MAX_OUTPUT_TOKENS)
     return est_in, est_out
 
 
@@ -128,11 +129,18 @@ def estimate_descriptions(
     splits: pd.DataFrame,
     taxonomy: pd.DataFrame,
     model: str | None = None,
+    cache: JsonlCache | None = None,
 ) -> float:
-    """Worst-case USD for writing every description (the same estimate the spend guard uses)."""
+    """Worst-case USD for writing the descriptions (the same estimate the spend guard uses).
+
+    With `cache`, products already described are free, so a rerun estimates $0.
+    """
     model = model or cfg.describe_model
     total = 0.0
-    for _p, labels, system, user in _requests(cfg, complaints, splits, taxonomy):
+    for product, labels, system, user in _requests(cfg, complaints, splits, taxonomy):
+        hit = None if cache is None else cache.get(_key(product, model))
+        if hit is not None and sorted(it["label"] for it in hit["items"]) == labels:
+            continue
         est_in, est_out = estimate_describe_tokens(system, user, len(labels))
         total += estimate_run(1, est_in, est_out, model, cfg.prices)
     return total
@@ -195,6 +203,10 @@ def validate_descriptions(raw: str, labels: list[str]) -> list[dict]:
 # --------------------------------------------------------------------------- runner
 
 
+def _key(product: str, model: str) -> str:
+    return f"{product}|describe|{model}|{DESCRIBE_VERSION}"
+
+
 def _rows(items: list[dict], model: str, version: str = DESCRIBE_VERSION) -> list[dict]:
     return [{**it, "model_id": model, "describe_version": version} for it in items]
 
@@ -224,7 +236,7 @@ def run_descriptions(
     reqs = _requests(cfg, complaints, splits, taxonomy)
     rows: list[dict] = []
     for n, (product, labels, system, user) in enumerate(reqs):
-        key = f"{product}|describe|{model}|{DESCRIBE_VERSION}"
+        key = _key(product, model)
         hit = cache.get(key)
         if hit is not None and sorted(it["label"] for it in hit["items"]) == labels:
             rows += _rows(hit["items"], model)
@@ -233,7 +245,7 @@ def run_descriptions(
         problem = ""
         for _attempt in range(MAX_ATTEMPTS):
             resp = _paid_call(client, ledger, limiter, sleep, model, est, system, user,
-                              remaining=len(reqs) - n)  # fmt: skip
+                              remaining=len(reqs) - n, rows=len(labels))  # fmt: skip
             try:
                 items = validate_descriptions(resp.text, labels)
             except ValueError as e:
@@ -253,7 +265,9 @@ def run_descriptions(
     return pd.DataFrame(rows, columns=DESCRIPTIONS_COLS)
 
 
-def _paid_call(client, ledger, limiter, sleep, model, est, system, user, remaining) -> LLMResponse:
+def _paid_call(
+    client, ledger, limiter, sleep, model, est, system, user, remaining, rows=None
+) -> LLMResponse:
     """reserve -> limiter.wait -> generate (with backoff) -> ledger.record."""
 
     def attempt():
@@ -272,7 +286,7 @@ def _paid_call(client, ledger, limiter, sleep, model, est, system, user, remaini
     # Ledger first: a crash after a paid response must never lose the charge.
     in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
     out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
-    ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
+    ledger.record(model, uuid.uuid4().hex, in_tok, out_tok, tag=DESCRIBE_TAG, rows=rows)
     return resp
 
 
@@ -293,6 +307,15 @@ def descriptions_fingerprint(descriptions: pd.DataFrame) -> str:
     """8 hex chars identifying the exact description wording (order independent)."""
     lines = sorted(f"{x}\t{d}" for x, d in zip(descriptions["label"], descriptions["description"]))
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:8]
+
+
+def prompt_tag(prompt_version: str, descriptions: pd.DataFrame) -> str:
+    """The recorded classification prompt version: `<prompt_version>+<fingerprint>`.
+
+    Used in the cache key, on every prediction row and as the ledger tag, so answers and costs
+    of different description wordings are never mixed up.
+    """
+    return f"{prompt_version}+{descriptions_fingerprint(descriptions)}"
 
 
 def load_descriptions(cfg: Config, taxonomy: pd.DataFrame) -> pd.DataFrame:

@@ -226,7 +226,7 @@ def test_fix5_key_check_passes_for_aq_key(capsys):
 
 def test_fix5_key_check_failure_prints_readme_fix(capsys):
     ok = colab.check_gemini_key(
-        "AIzaWRONG", make_client=lambda key: SimpleNamespace(models=_Models(BAD_KEY))
+        "AIzaWRONG", make_client=lambda key: SimpleNamespace(models=_Models(BAD_KEY)), stop=False
     )
     out = capsys.readouterr().out
     assert ok is False

@@ -360,7 +360,8 @@ def test_classification_reads_saved_descriptions(tmp_path, cfg, taxonomy):
                              limiter=limiter, sleep=lambda s: None)  # fmt: skip
     assert len(out) == 2
     system = client.calls[0][1]
-    assert "- Credit card|Fraud|Stolen card: About Credit card|Fraud|Stolen card." in system
+    assert "- label: Credit card|Fraud|Stolen card" in system
+    assert "  description: About Credit card|Fraud|Stolen card." in system
 
 
 def test_reserve_grows_with_description_length(tmp_path, cfg, taxonomy):

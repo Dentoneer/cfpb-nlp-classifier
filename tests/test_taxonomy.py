@@ -72,15 +72,18 @@ def _descriptions(t):
     return pd.DataFrame({"label": t["label"], "description": [f"About {x}." for x in t["sub_issue"]]})
 
 
-def test_prompt_text_one_line_per_label_sorted():
+def test_prompt_text_one_entry_per_label_sorted():
     t = build_taxonomy(_complaints())
     d = _descriptions(t)
     txt = taxonomy_prompt_text(t.sample(frac=1, random_state=1), d.sample(frac=1, random_state=2))
     assert txt == taxonomy_prompt_text(t, d)
     lines = txt.splitlines()
-    assert len(lines) == len(t)
-    assert lines == sorted(lines)
-    assert "- Credit reporting|Incorrect information|Wrong name: About Wrong name." in lines
+    assert len(lines) == 2 * len(t)
+    labels = [x.removeprefix("- label: ") for x in lines[::2]]
+    assert labels == sorted(t["label"])
+    assert all(x.startswith("  description: ") for x in lines[1::2])
+    i = lines.index("- label: Credit reporting|Incorrect information|Wrong name")
+    assert lines[i + 1] == "  description: About Wrong name."
     assert "(none)" not in txt
 
 

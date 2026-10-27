@@ -27,6 +27,7 @@ from nlp.schema import VALIDATOR_RESULTS_COLS
 from nlp.store import JsonlCache
 
 JEV_PROMPT_VERSION = "jev-v2"
+JEV_TAG = f"jev:{JEV_PROMPT_VERSION}"  # ledger tag of Jev requests
 RESERVE_SAFETY = 1.5  # multiplier on the input-token guess, as for Gemini
 JEV_FIELDS = ["product_ok", "issue_ok", "sub_issue_ok"]
 _LEVEL_OF = {"product_ok": "product", "issue_ok": "issue", "sub_issue_ok": "sub_issue"}
@@ -272,11 +273,12 @@ def run_jev(
                 raise DailyQuotaExhausted(len(queue) - i) from e
             raise
         except JevParseError as e:  # the call was paid even though we cannot read it
-            ledger.record(model, uuid.uuid4().hex, _tokens(e.input_tokens, est_in), 0)
+            ledger.record(model, uuid.uuid4().hex, _tokens(e.input_tokens, est_in), 0,
+                          tag=JEV_TAG, rows=1)
             raise
         # Ledger first: a crash after a paid response must never lose the charge.
         in_tok = _tokens(resp.input_tokens, est_in)  # odd usage never blocks recording
-        ledger.record(model, uuid.uuid4().hex, in_tok, 0)  # output tokens are free
+        ledger.record(model, uuid.uuid4().hex, in_tok, 0, tag=JEV_TAG, rows=1)  # output is free
         missing = [f for f in questions if f not in resp.nouls]
         if missing:
             raise JevError(f"Jev response for {cid} lacks answers {missing}: {sorted(resp.nouls)}")

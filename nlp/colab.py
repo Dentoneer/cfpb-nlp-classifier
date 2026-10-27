@@ -28,9 +28,12 @@ from nlp.llm.describe import (
     DescriptionError,
     apply_edits,
     descriptions_match,
+    load_descriptions,
+    prompt_tag,
     run_descriptions,
 )
 from nlp.llm.jev import estimate_jev_usd
+from nlp.llm.judge import SUMMARY_JUDGE_PROMPT_VERSION, estimate_summary_judge_usd
 from nlp.review import count_verdicts
 from nlp.sheets import (
     publish_taxonomy,
@@ -190,10 +193,13 @@ def _key_facts(api_key: str) -> str:
     return f"length {len(raw.strip())}, starts with '{raw.strip()[:3]}', whitespace: {ws}"
 
 
-def check_gemini_key(api_key: str, make_client: Callable | None = None) -> bool:
+def check_gemini_key(
+    api_key: str, make_client: Callable | None = None, stop: bool = True
+) -> bool:
     """Free check that Google accepts the Gemini key (lists models; nothing is generated).
 
-    Prints the result. On failure prints what to do (README 'Key problems') and returns False.
+    Prints the result. On failure raises StageIncomplete with what to do (README 'Key
+    problems'), so the notebook stops there; with stop=False it prints that and returns False.
     """
     key = (api_key or "").strip()
     note = (
@@ -208,13 +214,16 @@ def check_gemini_key(api_key: str, make_client: Callable | None = None) -> bool:
         from nlp.llm.client import explain_rejection
 
         why = explain_rejection(e) if hasattr(e, "code") else f"{type(e).__name__}: {e}"
-        print(
+        msg = (
             f"PROBLEM: the Gemini key check failed: {why}\n"
             "What to do: open README.md, section 'What to do if a notebook stops' -> 'Key "
             "problems'. In short: in Colab Secrets (key icon) delete GEMINI_API_KEY, paste the "
             "key again from aistudio.google.com/apikey (no spaces), switch Notebook access on, "
             "then Runtime -> Restart session and rerun from the top."
         )
+        if stop:
+            raise StageIncomplete(msg) from None
+        print(msg)
         return False
     print(f"Gemini key works ({n} models visible; {_key_facts(api_key)}).{note}")
     return True
@@ -411,16 +420,22 @@ def estimate_classification(
     batch_size: int | None = None,
     thinking: str | None = None,
     runs: int = 1,
+    cache: JsonlCache | None = None,
+    classifier_name: str | None = None,
 ) -> float:
     """Conservative USD estimate (the same token estimate the spend guard reserves with).
 
     Uses the saved category descriptions when they exist; before Part 0 has run, a
-    conservative stand-in description per category.
+    conservative stand-in description per category. With `cache` and `classifier_name`, rows
+    already answered for this run are left out, so a fully cached rerun estimates $0.
     """
     model = model or cfg.classifier_model
     bs = batch_size or cfg.batch_size
     thinking = thinking or cfg.thinking
-    tax = taxonomy_prompt_text(taxonomy, _descriptions_for_estimate(cfg, taxonomy))
+    desc = _descriptions_for_estimate(cfg, taxonomy)
+    if cache is not None and classifier_name is not None:
+        rows = uncached_rows(cfg, rows, taxonomy, cache, classifier_name, model)
+    tax = taxonomy_prompt_text(taxonomy, desc)
     text = [clean_text(str(t), cfg.max_chars) for t in rows["narrative"]]
     ids = [str(c) for c in rows["complaint_id"]]
     total = 0.0
@@ -440,20 +455,60 @@ def _descriptions_for_estimate(cfg: Config, taxonomy: pd.DataFrame):
     return {label: PLACEHOLDER_DESCRIPTION for label in taxonomy["label"]}
 
 
-def measured_usd_per_request(ledger: Ledger, model: str) -> float | None:
-    """Mean real USD per request for `model` from the ledger file (None if none recorded)."""
-    if not ledger.path.exists():
+def current_prompt_tag(cfg: Config, taxonomy: pd.DataFrame) -> str | None:
+    """The recorded prompt version classification uses now (None before Part 0)."""
+    try:
+        return prompt_tag(cfg.prompt_version, load_descriptions(cfg, taxonomy))
+    except StageIncomplete:
         return None
-    usd = []
+
+
+def uncached_rows(
+    cfg: Config,
+    rows: pd.DataFrame,
+    taxonomy: pd.DataFrame,
+    cache: JsonlCache,
+    classifier_name: str,
+    model: str | None = None,
+) -> pd.DataFrame:
+    """The rows of `rows` that `classifier_name` has not answered yet with the current prompt."""
+    tag = current_prompt_tag(cfg, taxonomy)
+    if tag is None:
+        return rows
+    model = model or cfg.classifier_model
+    done = [cache.get(f"{c}|{classifier_name}|{model}|{tag}") is not None
+            for c in rows["complaint_id"].astype(str)]  # fmt: skip
+    return rows[[not d for d in done]]
+
+
+def _ledger_lines(ledger: Ledger) -> list[dict]:
+    if not ledger.path.exists():
+        return []
+    out = []
     with ledger.path.open(encoding="utf-8") as f:
         for line in f:
             try:
                 rec = json.loads(line)
-                if rec["model"] == model:
-                    usd.append(float(rec["usd"]))
+                float(rec["usd"])
+                out.append(rec)
             except (ValueError, KeyError, TypeError):
                 continue
+    return out
+
+
+def measured_usd_per_request(ledger: Ledger, model: str) -> float | None:
+    """Mean real USD per request for `model` from the ledger file (None if none recorded)."""
+    usd = [float(r["usd"]) for r in _ledger_lines(ledger) if r.get("model") == model]
     return sum(usd) / len(usd) if usd else None
+
+
+def measured_usd_per_row(ledger: Ledger, model: str, tag: str) -> float | None:
+    """Real USD per complaint for `model` from ledger lines with this exact `tag` (the
+    current prompt), so older, smaller prompts never lower the projection."""
+    lines = [r for r in _ledger_lines(ledger)
+             if r.get("model") == model and r.get("tag") == tag and r.get("rows")]  # fmt: skip
+    n = sum(int(r["rows"]) for r in lines)
+    return sum(float(r["usd"]) for r in lines) / n if n else None
 
 
 def estimate_measured(
@@ -464,12 +519,18 @@ def estimate_measured(
     model: str | None = None,
     batch_size: int | None = None,
     runs: int = 1,
+    tag: str | None = None,
 ) -> float | None:
-    """Realistic USD: measured $/request for the model x requests needed x 1.5 safety.
+    """Realistic USD from real past requests x 1.5 safety.
 
-    None when the ledger has no record for the model yet (use the reserve bound instead).
+    With `tag`: real $ per complaint of requests made with exactly that prompt. Without it:
+    mean $ per request for the model x requests needed. None when nothing comparable has been
+    recorded yet (use the reserve bound instead).
     """
     model = model or cfg.classifier_model
+    if tag is not None:
+        per_row = measured_usd_per_row(ledger, model, tag)
+        return None if per_row is None else runs * len(rows) * per_row * MEASURED_SAFETY
     per = measured_usd_per_request(ledger, model)
     if per is None:
         return None
@@ -666,6 +727,41 @@ def cached_predictions(
     return run, pd.DataFrame(by_run[run])
 
 
+V1_REFERENCE = (
+    "For reference, the first run (prompt v1, gemini-3.8-flash, different complaints - a rough "
+    "guide only), product/issue/sub-issue/path: bake-off on 50 tuning complaints "
+    ".84/.62/.40/.38; 800-row test .820/.514/.371/.324."
+)
+MIN_OLD_OVERLAP = 30  # show the old-prompt comparison only with at least this many complaints
+OTHER_PAID_USD = 0.15  # Jev + summary judge, for the rough projection after Part C
+
+
+def project_rest_of_phase(cfg: Config, ledger: Ledger, taxonomy: pd.DataFrame) -> float | None:
+    """Print the projected Gemini cost of Part D + notebook 04 from the current prompt's real
+    cost per complaint (x1.5 safety); None if no request with this prompt is recorded yet."""
+    tag = current_prompt_tag(cfg, taxonomy)
+    per_row = None if tag is None else measured_usd_per_row(ledger, cfg.classifier_model, tag)
+    if per_row is None:
+        return None
+    n = cfg.test_n + 2 * cfg.self_consistency_n
+    usd = n * per_row * MEASURED_SAFETY
+    left = ledger.cap_usd - ledger.spent()
+    print(
+        f"Projected cost for the rest of the phase: about ${usd + OTHER_PAID_USD:.2f} "
+        f"(test run {cfg.test_n} + self-consistency 2 x {cfg.self_consistency_n} complaints at "
+        f"${per_row:.4f} each, measured just now, x1.5 safety; plus ~${OTHER_PAID_USD:.2f} for "
+        f"Jev and the summary judge). Remaining cap ${left:.2f}. This is an estimate; the spend "
+        "guard still refuses any request that would cross the cap."
+    )
+    if usd + OTHER_PAID_USD > left:
+        print(
+            "That will not fit in what is left of the cap. Nothing more has been spent. Options: "
+            "use batch size 25 (Part B; the category list is then sent 2.5x less often, which "
+            "costs much less), or ask Claude. Do not start Part D until it fits."
+        )
+    return usd + OTHER_PAID_USD
+
+
 def prompt_check(
     cfg: Config,
     tuning_df: pd.DataFrame,
@@ -676,10 +772,18 @@ def prompt_check(
     limiter: RateLimiter | None = None,
     old_version: str = "v1",
 ) -> pd.DataFrame:
-    """Part C: the current prompt on all tuning complaints, compared (on the complaints both
-    saw) with answers the old prompt gave on the first run, if any are saved. Free to rerun."""
+    """Part C: the current prompt on all tuning complaints vs TF-IDF on the same complaints.
+
+    Also prints the first run's (v1) numbers for reference, an old-prompt row when at least 30
+    of these complaints were answered by the old prompt, and a cost projection for the rest of
+    the phase from this check's real cost. A fully cached rerun is free and never blocked.
+    """
     name = f"tuning_{cfg.prompt_version}"
-    check_fits(ledger, estimate_classification(cfg, tuning_df, taxonomy), "Tuning check")
+    check_fits(
+        ledger,
+        estimate_classification(cfg, tuning_df, taxonomy, cache=cache, classifier_name=name),
+        "Tuning check",
+    )
     got: dict[str, pd.DataFrame] = {}
 
     def run() -> pd.DataFrame:
@@ -687,18 +791,28 @@ def prompt_check(
                                          taxonomy=taxonomy, limiter=limiter)  # fmt: skip
         return got["pred"]
 
-    label = f"new prompt ({cfg.prompt_version})"
-    table = compare_runs({f"{label}, all {len(tuning_df)}": run}, tuning_df, ledger)
-    old_run, old = cached_predictions(cache, tuning_df["complaint_id"], cfg.classifier_model,
-                                      old_version)  # fmt: skip
+    label = f"Gemini, new prompt ({cfg.prompt_version})"
+    table = compare_runs({label: run}, tuning_df, ledger)
     new = got.get("pred")
-    if old_run is None or new is None:
-        print(f"No answers from the old prompt ({old_version}) are saved for these complaints "
-              f"with {cfg.classifier_model}; nothing to compare.")  # fmt: skip
+    if new is None:
+        print("The tuning check did not run (see the 'skipped' reason above); nothing to "
+              "compare. Fix that first, then rerun this cell.")  # fmt: skip
+        print(table.round(3).to_string(index=False))
+        return table
+    ids = set(tuning_df["complaint_id"].astype(str))
+    extra = []
+    if store.exists(cfg, P.stage_pred("tfidf")):
+        tf = store.read(cfg, P.stage_pred("tfidf"))
+        tf = tf[tf["complaint_id"].astype(str).isin(ids)]
+        extra.append({"run": "TF-IDF (same complaints)", "status": "ok", "rows_done": len(tf),
+                      "of": len(tuning_df), **accuracy_by_level(tf, tuning_df), "usd": 0.0})  # fmt: skip
     else:
-        same = sorted(set(old["complaint_id"]) & set(new["complaint_id"].astype(str)))
+        print("No TF-IDF predictions found (notebook 02), so no TF-IDF comparison.")
+    old_run, old = cached_predictions(cache, ids, cfg.classifier_model, old_version)
+    same = sorted(set(old["complaint_id"]) & set(new["complaint_id"].astype(str)))
+    if len(same) >= MIN_OLD_OVERLAP:
         n = len(same)
-        extra = [
+        extra += [
             {"run": f"old prompt ({old_version}), same {n}", "status": f"saved run {old_run}",
              "rows_done": n, "of": n, **accuracy_by_level(old[old["complaint_id"].isin(same)],
              tuning_df), "usd": 0.0},
@@ -706,10 +820,14 @@ def prompt_check(
              **accuracy_by_level(new[new["complaint_id"].astype(str).isin(same)], tuning_df),
              "usd": 0.0},
         ]  # fmt: skip
+    elif same:
+        print(f"Only {len(same)} of these complaints were answered by the {old_version} prompt "
+              f"(fewer than {MIN_OLD_OVERLAP}), so no direct comparison with it.")  # fmt: skip
+    if extra:
         table = pd.concat([table, pd.DataFrame(extra)], ignore_index=True)
-        print(f"Compared with the old prompt on the {n} complaints both answered "
-              f"(saved run '{old_run}').")  # fmt: skip
     print(table.round(3).to_string(index=False))
+    print(V1_REFERENCE)
+    project_rest_of_phase(cfg, ledger, taxonomy)
     return table
 
 
@@ -736,7 +854,7 @@ def diagnose(
     )
     print(f"google-genai library version: {genai_version}")
     print(f"Gemini key: {_key_facts(api_key)}")
-    check_gemini_key(api_key, make_client=make_client)
+    check_gemini_key(api_key, make_client=make_client, stop=False)
     print(ledger_report(ledger))
     per_model: dict[str, int] = {}
     if ledger.path.exists():
@@ -765,25 +883,42 @@ def phase_estimate(
     taxonomy: pd.DataFrame,
     test_df: pd.DataFrame,
     sc_rows: pd.DataFrame,
+    cache: JsonlCache | None = None,
 ) -> pd.DataFrame:
-    """Per remaining paid step: `bound_usd` (worst case) and `usd` (measured, <= bound)."""
+    """Per remaining paid step: `bound_usd` (worst case) and `usd` (measured, <= bound).
+
+    Gemini classification is measured only from requests made with the current prompt (its
+    ledger tag), never from older, smaller prompts; until there are some, the estimate is the
+    bound computed from the real prompt text. With `cache`, complaints already answered are
+    left out of the classification steps.
+    """
     judge = cfg.judge_model
     hc = test_df.head(cfg.hand_check_n)
-    spec = [  # (stage, label, rows, model)
-        (P.STAGE_PRED_GEMINI, "Test classification", test_df, cfg.classifier_model),
-        (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2", sc_rows, cfg.classifier_model),
-        (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3", sc_rows, cfg.classifier_model),
-        (P.STAGE_JEV, "Jev validator, full test", test_df, cfg.jev_model),
-        (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows", hc, judge),
-    ]
+    tag = current_prompt_tag(cfg, taxonomy)
+    spec = [  # (stage, label, rows, model, classifier name)
+        (P.STAGE_PRED_GEMINI, "Test classification", test_df, cfg.classifier_model, "gemini"),
+        (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2", sc_rows, cfg.classifier_model,
+         "gemini_sc2"),
+        (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3", sc_rows, cfg.classifier_model,
+         "gemini_sc3"),
+        (P.STAGE_JEV, "Jev validator, full test", test_df, cfg.jev_model, None),
+        (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows", hc, judge, None),
+    ]  # fmt: skip
     out = []
-    for stage, label, rows, model in spec:
+    for stage, label, rows, model, clf in spec:
         if model == cfg.jev_model:  # one request per complaint, input-only pricing
             bound = estimate_jev_usd(cfg, rows, model)
             meas = estimate_measured(cfg, ledger, rows, model=model, batch_size=1)
+        elif stage == P.STAGE_SUMMARY_JUDGE:
+            bound = estimate_summary_judge_usd(cfg, rows, model)
+            meas = estimate_measured(cfg, ledger, rows, model=model,
+                                     tag=f"summary_judge:{SUMMARY_JUDGE_PROMPT_VERSION}")  # fmt: skip
         else:
+            if cache is not None:
+                rows = uncached_rows(cfg, rows, taxonomy, cache, clf, model)
             bound = estimate_classification(cfg, rows, taxonomy, model=model)
-            meas = estimate_measured(cfg, ledger, rows, model=model)
+            meas = None if tag is None else estimate_measured(cfg, ledger, rows, model=model,
+                                                              tag=tag)  # fmt: skip
         out.append(
             (stage, label, bound, bound if meas is None else min(meas, bound),
              meas is not None, store.exists(cfg, stage))
@@ -855,10 +990,43 @@ def make_descriptions(
     return d
 
 
-def publish_descriptions(cfg: Config, gc, taxonomy: pd.DataFrame, descriptions: pd.DataFrame) -> str:
+def _same_text(a: object, b: object) -> bool:
+    return " ".join(str(a).split()) == " ".join(str(b).split())
+
+
+def publish_descriptions(
+    cfg: Config,
+    gc,
+    taxonomy: pd.DataFrame,
+    descriptions: pd.DataFrame,
+    overwrite_edits: bool = False,
+) -> str:
     """Show the descriptions in the taxonomy Google Sheet (label, product, issue, sub_issue,
-    description); creates the Sheet first if notebook 01 has not."""
-    url = publish_once(cfg, "taxonomy", lambda: publish_taxonomy(gc, taxonomy))
+    description); creates the Sheet first if notebook 01 has not.
+
+    Never wipes Marco's edits: if the Sheet already has descriptions that differ from the
+    saved ones, the Sheet is left alone (unless `overwrite_edits`) and he is told what to do.
+    """
+    title = f"CFPB taxonomy ({cfg.data_version})"
+    url = publish_once(cfg, "taxonomy", lambda: publish_taxonomy(gc, taxonomy, title))
+    if not overwrite_edits:
+        try:
+            sheet = read_description_edits(gc, url)
+        except ValueError:  # no description column yet: nothing to protect
+            sheet = None
+        if sheet is not None and len(sheet):
+            saved = dict(zip(descriptions["label"], descriptions["description"]))
+            differ = [x for x, t in zip(sheet["label"], sheet["description"])
+                      if x in saved and not _same_text(t, saved[x])]  # fmt: skip
+            if differ:
+                print(
+                    f"{len(differ)} description(s) in the Sheet differ from the saved ones (your "
+                    f"edits?), e.g. {differ[:3]}. The Sheet was NOT changed. To keep them, run the "
+                    "'use your own edits' cell below. To throw them away and show the saved "
+                    "descriptions instead, set DISCARD_SHEET_EDITS = True in this cell and rerun it."
+                )
+                print("Taxonomy sheet:", url)
+                return url
     rewrite_taxonomy_sheet(gc, url, taxonomy, descriptions)
     print("Taxonomy sheet with descriptions:", url)
     return url
@@ -882,6 +1050,12 @@ def load_description_edits(cfg: Config, gc, taxonomy: pd.DataFrame) -> pd.DataFr
         if changed
         else "No description changed."
     )
+    if changed and store.exists(cfg, P.STAGE_PRED_GEMINI):
+        print(
+            "WARNING: the 800-row test run (Part D) already used the old wording. Notebook 04's "
+            "self-consistency reruns would now use the new wording, mixing two prompts. Load "
+            "edits only before Part C/D; tell Claude if you want to redo the test run."
+        )
     return new
 
 

@@ -72,6 +72,8 @@ class FakeClient:
         return self.responder(model, system, user, response_schema, thinking)
 
 
+MAX_OUTPUT_TOKENS = 65536  # output limit of every Gemini model we use; never ask for more
+
 KEY_HELP = "Gemini rejected the API key. See README 'Key problems'."
 
 

@@ -39,8 +39,11 @@ catch Gemini's mistakes, and a clear **go / no-go** answer (is Gemini accurate e
 on the Product level, to build the real thing?).
 
 **Total time:** about 4-6 hours spread over a few sittings, including about 2 hours of hand review.
-**Total cost:** about $3.5-4 of the $5.00 hard cap, counting the ~$1.21 already spent on the first
-run (about $2.4-2.7 still to spend). The code refuses to spend past $5.00.
+**Total cost (estimate):** roughly $3-4 still to spend on top of the ~$1.21 the first run used, so
+close to the $5.00 hard cap. The new prompt is 2-3 times longer than the first run's (it carries a
+description of every category), so these are estimates, not promises: every paid cell prints its own
+estimate first, Part C prints a projection for the rest from its real cost, and the code refuses to
+spend past $5.00 (nothing is wasted if it stops).
 
 > The notebooks download the code from the `main` branch on GitHub. Make sure the Phase 1 pull
 > request has been merged before you start.
@@ -90,8 +93,8 @@ Run them in order. More detail and the same table are in [notebooks/README.md](n
 | 00 | Setup check | 3 min | $0 |
 | 01 | Data and splits | 5-15 min | $0 |
 | 02 | Baselines (needs GPU) | 45-90 min | $0 |
-| 03 | Gemini | 30-90 min | ~$1.8-2.1 |
-| 04 | Validators + review sheet | 30-60 min | ~$0.6-0.7 |
+| 03 | Gemini | 30-90 min | ~$2.2-3.5 (estimate) |
+| 04 | Validators + review sheet | 30-60 min | ~$0.6-1.0 (estimate) |
 | 05 | Results | 5 min | $0 |
 
 **00 Setup check.** Connects Drive, checks your keys and Google Sheets. *Look for:* a line starting
@@ -118,33 +121,36 @@ reconnect, rerun the first cell and the cell that was running; finished models a
 Drive.
 
 **03 Gemini (money is spent here).**
-- *Part 0, category descriptions (about $0.30, once).* Gemini writes a short description of every
+- *Part 0, category descriptions (about $0.3-0.4, once).* Gemini writes a short description of every
   category (what it covers, when to use it, which similar category to use instead) from example
   training complaints. Run the estimate cell, then the cell that writes them. They appear in a new
   `description` column of the taxonomy Google Sheet. *Optional:* if you want to improve some, edit
   only the `description` column in the Sheet (never the `label` column) and run the "use your own
-  edits" cell; it checks your edits and saves them. Skip that cell if you made no edits.
+  edits" cell; it checks your edits and saves them. Skip that cell if you made no edits. Load edits
+  only before Part C/D. Rerunning the Part 0 cell never overwrites edits you made in the Sheet.
 - *Part A, model bake-off (up to ~$0.30).* **Skip Parts A and B if you already picked on the first
   run: your saved picks are kept.** Otherwise three Gemini models try the same 50 complaints. Look at
   the `path` column (all three levels right) and `usd`. Type the winner into the pick cell and run it.
   If Google refuses a model, its row says `skipped` with the reason and nothing is charged.
 - *Part B, batch size and thinking (~$0.05-0.15).* Keep batch size 10 unless 25 is just as accurate. Pick
   the lowest thinking level that keeps accuracy (`low` or `medium`).
-- *Part C, tuning check (about $0.25).* Classifies all 200 tuning complaints with the new prompt and
-  compares with the old prompt's saved answers on the same complaints. Look at the `path` column of
-  the "same" rows: is the new prompt better?
+- *Part C, tuning check (about $0.4-0.6).* Classifies all 200 tuning complaints with the new prompt
+  and compares it with TF-IDF on the same 200 complaints. It also prints the first run's numbers for
+  reference and a **projected cost for the rest of the phase**, measured from this check. Look at the
+  `path` column: is Gemini ahead of TF-IDF now? If the projection says it will not fit, stop and ask
+  Claude (batch size 25 is much cheaper).
 - *Troubleshoot (optional, free).* Prints your settings, the library version, facts about your key
   (never the key), a free key check, the spend so far and saved answers per run. Send its output to
   Claude if something looks wrong.
-- *Part D, the test run (about $1.2-1.5, 15-40 min).* Classifies 800 test complaints. Look at
+- *Part D, the test run (about $1.5-2.5, 15-40 min; see Part C's projection).* Classifies 800 test complaints. Look at
   accuracy per level and the spend line.
 
 Every paid cell prints an **estimate first**. Read it before continuing.
 
 **04 Validators and the review sheet.** Runs the checks that try to catch Gemini's mistakes (Jev,
 repeated runs, agreement with the other models, label-noise detection) and builds your review
-Google Sheet. Paid steps cost about $0.65 in total (self-consistency reruns ~$0.5, Jev and the
-summary judge ~$0.15). At the end it prints the **link to the
+Google Sheet. Paid steps cost roughly $0.6-1.0 in total (self-consistency reruns ~$0.5-0.8, Jev
+and the summary judge ~$0.15); the cell prints an estimate before each one. At the end it prints the **link to the
 review sheet**. Then you stop (see below).
 
 **05 Results.** Reads your review, combines everything, prints the scoreboards and the go/no-go

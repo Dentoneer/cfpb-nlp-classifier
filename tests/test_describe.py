@@ -128,7 +128,7 @@ def test_reserve_before_generate_and_ledger_before_cache(tmp_path, cfg):
     client, ledger, cache, limiter = tools(tmp_path, good_responder())
     orig_reserve, orig_record, orig_put = ledger.reserve, ledger.record, cache.put
     ledger.reserve = lambda *a: (order.append("reserve"), orig_reserve(*a))[1]
-    ledger.record = lambda *a: (order.append("record"), orig_record(*a))[1]
+    ledger.record = lambda *a, **k: (order.append("record"), orig_record(*a, **k))[1]
     cache.put = lambda *a: (order.append("put"), orig_put(*a))[1]
     run(cfg, client, ledger, cache, limiter)
     assert order[:3] == ["reserve", "record", "put"]
@@ -255,3 +255,11 @@ def test_apply_edits_validates_and_marks_changes():
     blank.loc[2, "description"] = ""
     with pytest.raises(StageIncomplete, match="empty"):
         apply_edits(cur, blank)
+
+
+def test_estimate_is_zero_once_every_product_is_cached(tmp_path, cfg):
+    complaints, splits, tax = _data()
+    client, ledger, cache, limiter = tools(tmp_path, good_responder())
+    assert estimate_descriptions(cfg, complaints, splits, tax, cache=cache) > 0
+    run(cfg, client, ledger, cache, limiter)
+    assert estimate_descriptions(cfg, complaints, splits, tax, cache=cache) == 0.0

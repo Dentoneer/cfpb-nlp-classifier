@@ -46,7 +46,7 @@ ISSUES_PER_PRODUCT = [5, 4, 4, 4, 4, 4]  # 25 issues
 N_TWO_SUB_ISSUES = 15  # 15 issues x 2 sub-issues + 10 issues x 1 sub-issue = 40 paths
 _REQ_ID = re.compile(r"^complaint_id: (\S+)$", re.MULTILINE)
 _LABEL = re.compile(r"^LABEL: (.+)$", re.MULTILINE)
-_LISTED = re.compile(r"^- ([^:\n]+\|[^:\n]+\|[^:\n]+): (.+)$", re.MULTILINE)
+_LISTED = re.compile(r"^- label: (.+)\n  description: (.+)$", re.MULTILINE)
 _QUOTED = re.compile(r'"([^"]*)"')
 MODEL = "gemini-3.8-flash"
 

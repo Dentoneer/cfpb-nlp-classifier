@@ -20,6 +20,7 @@ __all__ = [
     "taxonomy_prompt_text",
 ]
 
+_PIPE_SPACES = re.compile(r"\s*\|\s*")
 _QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'})
 
 
@@ -65,17 +66,22 @@ def normalize_path(
     return hits[0] if len(hits) == 1 else None
 
 
+def _norm_label(s: object) -> str:
+    return _PIPE_SPACES.sub(LABEL_SEP, _norm(s))
+
+
 def normalize_label(taxonomy: pd.DataFrame, label: object) -> str | None:
     """The exact taxonomy label for `label`: exact match, else the one label equal after
-    normalization (quotes, whitespace, case - as in `normalize_path`), else None."""
+    normalization (quotes, whitespace, case - as in `normalize_path` - and spaces around
+    `|`), else None."""
     labels = list(taxonomy["label"])
     text = "" if label is None else str(label)
     if text in set(labels):
         return text
-    want = _norm(text)
+    want = _norm_label(text)
     if not want:
         return None
-    hits = list(dict.fromkeys(x for x in labels if _norm(x) == want))
+    hits = list(dict.fromkeys(x for x in labels if _norm_label(x) == want))
     return hits[0] if len(hits) == 1 else None
 
 
@@ -86,8 +92,12 @@ def _description_map(descriptions) -> dict[str, str]:
 
 
 def taxonomy_prompt_text(taxonomy: pd.DataFrame, descriptions) -> str:
-    """One line per taxonomy row, sorted by label: `- <label>: <description>`.
+    """Two lines per taxonomy row, sorted by label::
 
+        - label: <label>
+          description: <description>
+
+    The label is the whole rest of its line, so names containing ':' stay unambiguous.
     `descriptions` is the descriptions table (label, description) or a label -> text mapping;
     every taxonomy label needs a non-empty description (ValueError otherwise).
     """
@@ -96,7 +106,9 @@ def taxonomy_prompt_text(taxonomy: pd.DataFrame, descriptions) -> str:
     missing = [x for x in labels if not desc.get(x, "").strip()]
     if missing:
         raise ValueError(f"{len(missing)} taxonomy label(s) have no description, e.g. {missing[:3]}")
-    return "\n".join(f"- {x}: {' '.join(desc[x].split())}" for x in labels)
+    return "\n".join(
+        f"- label: {x}\n  description: {' '.join(desc[x].split())}" for x in labels
+    )
 
 
 def _differs(month: dict[tuple, float], ref: dict[tuple, float], tol: float) -> bool:

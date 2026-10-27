@@ -14,7 +14,7 @@ import pandas as pd
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.config import Config
 from nlp.data import clean_text
-from nlp.llm.client import GeminiClient, RateLimited, ServiceUnavailable
+from nlp.llm.client import MAX_OUTPUT_TOKENS, GeminiClient, RateLimited, ServiceUnavailable
 from nlp.schema import PREDICTIONS_COLS, split_label
 from nlp.sheets import taxonomy_snapshot_hash
 from nlp.store import JsonlCache
@@ -52,12 +52,12 @@ def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -
     """
     system = (
         f"[prompt {prompt_version}] You classify US consumer financial complaints.\n"
-        "Each line of the CATEGORIES list below is one category: its label "
-        "(Product|Issue|Sub-issue), a colon, then a description of what it covers and when to "
-        "use it. Read the descriptions to tell similar categories apart.\n"
+        "The CATEGORIES list below has one entry per category: a line \"- label: <label>\" "
+        "(Product|Issue|Sub-issue) and an indented line \"description: ...\" saying what it "
+        "covers and when to use it. Read the descriptions to tell similar categories apart.\n"
         "For each complaint choose exactly one label from the list and copy it verbatim: the "
-        "whole text between \"- \" and the colon, with the | separators exactly as written. Never "
-        "invent or shorten a label.\n"
+        "whole text after \"- label: \" on its line, with the | separators exactly as written. "
+        "Never invent or shorten a label.\n"
         "For each complaint also write a summary of at most 60 words that uses only facts "
         "stated in the complaint text (no guesses, no outside knowledge), and a confidence "
         "between 0 and 1 that the chosen label is correct.\n"
@@ -75,10 +75,11 @@ def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -
 
 
 def estimate_request_tokens(system: str, user: str, n_rows: int, thinking: str) -> tuple[int, int]:
-    """Conservative (est_in, est_out) for Ledger.reserve (est_out is also max_output_tokens)."""
+    """Conservative (est_in, est_out) for Ledger.reserve (est_out is also max_output_tokens,
+    clamped to the model's output limit so Google never rejects the request for size)."""
     allowance = {"none": 0, "minimal": 0, "low": 512}.get(thinking, 2048)
     est_in = int((len(system) + len(user)) / 4 * RESERVE_SAFETY)
-    est_out = int(n_rows * (150 + allowance) * 1.5)
+    est_out = min(int(n_rows * (150 + allowance) * 1.5), MAX_OUTPUT_TOKENS)
     return est_in, est_out
 
 
@@ -200,6 +201,7 @@ def run_queue(
     schema: dict,
     request: Callable[[list[str]], tuple[str, str]],
     handle: Callable[[str, list[str]], list[str]],
+    tag: str | None = None,
 ) -> set[str]:
     """Shared sequential, spend-safe request loop (classification and judging).
 
@@ -231,7 +233,7 @@ def run_queue(
         # No usage metadata after a paid call: record the conservative estimate, never raise.
         in_tok = est[0] if resp.input_tokens is None else resp.input_tokens
         out_tok = est[1] if resp.output_tokens is None else resp.output_tokens
-        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok)
+        ledger.record(model, uuid.uuid4().hex, in_tok, out_tok, tag=tag, rows=len(batch_ids))
         for cid in handle(resp.text, batch_ids):
             attempts[cid] = attempts.get(cid, 0) + 1
             if attempts[cid] > MAX_RETRIES:
@@ -272,14 +274,14 @@ def run_classification(
     prompt_version = prompt_version or cfg.prompt_version
     thinking = thinking or cfg.thinking
     limiter = limiter or RateLimiter(cfg.rpm)
-    from nlp.llm.describe import descriptions_fingerprint, load_descriptions  # avoids a cycle
+    from nlp.llm.describe import load_descriptions, prompt_tag  # avoids an import cycle
 
     if descriptions is None:
         descriptions = load_descriptions(cfg, taxonomy)
     tax_text = taxonomy_prompt_text(taxonomy, descriptions)
     # The recorded version names the exact description wording, so answers given with older
     # (e.g. since edited) descriptions are never reused from the cache.
-    prompt_version = f"{prompt_version}+{descriptions_fingerprint(descriptions)}"
+    prompt_version = prompt_tag(prompt_version, descriptions)
     tax_hash = taxonomy_snapshot_hash(taxonomy)
 
     def key(cid: str) -> str:
@@ -316,7 +318,7 @@ def run_classification(
     failed = run_queue(
         queue, batch_size=cfg.batch_size, client=client, ledger=ledger, limiter=limiter,
         sleep=sleep, model=model, thinking=thinking, schema=RESPONSE_SCHEMA,
-        request=request, handle=handle,
+        request=request, handle=handle, tag=prompt_version,
     )  # fmt: skip
 
     if failed:

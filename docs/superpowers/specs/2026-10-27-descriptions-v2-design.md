@@ -171,7 +171,11 @@ About $1.21 has been spent; the ledger is kept. **Marco raised the hard cap from
 | Self-consistency x2 (150 rows) | ~$0.5 |
 | Jev + summary judge | ~$0.15 |
 
-That totals about $2.4-2.7, which fits under the $5.00 cap with about $1 to spare. The existing
+That totals about $2.4-2.7, which fits under the $5.00 cap with about $1 to spare. _(Review fix
+round 1: with ~150 categories the v2 prompt is 2-3x the v1 request size, so realistic figures are
+higher - descriptions ~$0.35, tuning check ~$0.5, test ~$1.5-2.5, self-consistency ~$0.5-0.8 - about
+$3-4 in total, close to the $3.79 left. Part C now prints a projection from its real cost and warns
+if the rest will not fit; batch size 25 is the main lever.)_ The existing
 phase-estimate gate stops cleanly if it would not fit. Changing `spend_cap_usd` is Marco's decision
 only.
 

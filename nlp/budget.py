@@ -76,19 +76,34 @@ class Ledger:
                 f"spent ${spent:.4f} + est ${est:.4f} would exceed cap ${self.cap_usd:.2f}"
             )
 
-    def record(self, model: str, request_id: str, in_tok: int, out_tok: int) -> float:
-        """Durably log actual spend (never refuses) and return its USD."""
+    def record(
+        self,
+        model: str,
+        request_id: str,
+        in_tok: int,
+        out_tok: int,
+        tag: str | None = None,
+        rows: int | None = None,
+    ) -> float:
+        """Durably log actual spend (never refuses) and return its USD.
+
+        Optional `tag` (which prompt / step paid) and `rows` (items in the request) let cost
+        projections use only comparable requests; lines without them stay valid.
+        """
         usd = self.cost(model, in_tok, out_tok)
-        line = json.dumps(
-            {
-                "ts": time.time(),
-                "model": model,
-                "request_id": request_id,
-                "input_tokens": in_tok,
-                "output_tokens": out_tok,
-                "usd": usd,
-            }
-        )
+        rec = {
+            "ts": time.time(),
+            "model": model,
+            "request_id": request_id,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "usd": usd,
+        }
+        if tag is not None:
+            rec["tag"] = tag
+        if rows is not None:
+            rec["rows"] = int(rows)
+        line = json.dumps(rec)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         prefix = "\n" if self._needs_newline() else ""  # after a crash mid-write
         with self.path.open("a", encoding="utf-8") as f:

@@ -26,7 +26,8 @@ plan: `docs/superpowers/plans/2026-10-26-phase1-colab-nlp.md`. Run guide: `READM
   (`StageIncomplete`: plain-English stop), `colab.py` (notebook setup/helpers: archive on
   `data_version` change, key check, `diagnose`, description stage + Sheet, `prompt_check`)
 - `data.py` (load + filters), `taxonomy.py` (taxonomy with `label` = `Product|Issue|Sub-issue`,
-  unique per row; names may not contain `|`; prompt listing `- <label>: <description>`),
+  unique per row; names may not contain `|`; prompt listing `- label: <label>` +
+  indented `description: ...` so names with `:` stay unambiguous),
   `sampling.py` (stratified splits, seed 20261026)
 - `classifiers/` — `tfidf.py`, `embed.py` (embeddings+LR, kNN, `FakeEncoder`), `modernbert.py`,
   `base.py`; `llm/` — `describe.py` (one Gemini request per product writes every label's
@@ -58,6 +59,11 @@ plan: `docs/superpowers/plans/2026-10-26-phase1-colab-nlp.md`. Run guide: `READM
   never answered from the cache; description cache key = `product|describe|model|DESCRIBE_VERSION`.
   Every prediction row carries `model_id` and `prompt_version`. Judge model must differ from
   classifier model. Classification needs the descriptions stage (notebook 03 Part 0).
+- Ledger lines may carry `tag` (classification: the recorded prompt version; `describe:d1`,
+  `summary_judge:sj-v1`, `jev:<ver>`) and `rows`; cost projections for classification use only
+  lines with the current tag (per complaint), never older smaller prompts. Estimate gates skip
+  cached rows, so a fully cached rerun costs $0 and is never blocked. `max_output_tokens` is
+  clamped to `MAX_OUTPUT_TOKENS` (65536).
 - `data_version` (config) vs Drive `data_version.txt`: `setup()` archives old `*.parquet`,
   `models/`, Sheet URL files, `results.md` into `archive_<old>/`; never moves the ledger, caches or
   `config_overrides.json`. Bump `data_version` whenever stored stages become incompatible.
