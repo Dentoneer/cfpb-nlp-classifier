@@ -7,8 +7,11 @@ from nlp.schema import TAXONOMY_COLS
 from nlp.taxonomy import (
     build_taxonomy,
     choose_window,
+    label_of,
+    normalize_label,
     normalize_path,
     path_id,
+    split_label,
     taxonomy_prompt_text,
 )
 
@@ -17,8 +20,8 @@ def _complaints():
     rows = [
         ("Credit reporting", "Incorrect information", "Wrong name"),
         ("Credit reporting", "Incorrect information", "Wrong name"),
-        ("Credit reporting", "Incorrect information", "(none)"),
-        ("Debt collection", "Attempts to collect", "(none)"),
+        ("Credit reporting", "Incorrect information", "Wrong address"),
+        ("Debt collection", "Attempts to collect", "Debt is not yours"),
         ("Debt collection", "Attempts to collect", "Not owed"),
     ]
     return pd.DataFrame(rows, columns=["product", "issue", "sub_issue"])
@@ -33,32 +36,67 @@ def test_build_taxonomy_unique_sorted():
     assert keys == sorted(keys)
     assert t["path_id"].iloc[0] == path_id(*keys[0])
     assert " || " in t["path_id"].iloc[0]
+    assert t["label"].iloc[0] == "|".join(keys[0])
+    assert t["label"].is_unique
+
+
+def test_label_roundtrip():
+    assert label_of("P", "I", "S") == "P|I|S"
+    assert split_label("P|I|S") == ("P", "I", "S")
+
+
+def test_build_taxonomy_rejects_pipe_in_names():
+    df = pd.DataFrame([("Credit|card", "Fees", "Late fee")], columns=["product", "issue", "sub_issue"])
+    with pytest.raises(ValueError, match=r"\|"):
+        build_taxonomy(df)
 
 
 def test_normalize_parse_variants():
     t = build_taxonomy(
         pd.DataFrame(
             [
-                ("Credit reporting", "Can't verify", "(none)"),
+                ("Credit reporting", "Can't verify", "Old debt"),
                 ("Debt collection", "Attempts", "Not owed"),
                 ("Debt collection", "attempts", "Not owed"),
             ],
             columns=["product", "issue", "sub_issue"],
         )
     )
-    got = normalize_path(t, " credit REPORTING… ".replace("…", ""), "Can’t  verify ", "(NONE)")
-    assert got == ("Credit reporting", "Can't verify", "(none)")
+    got = normalize_path(t, " credit REPORTING… ".replace("…", ""), "Can’t  verify ", "OLD debt")
+    assert got == ("Credit reporting", "Can't verify", "Old debt")
     assert normalize_path(t, "Debt collection", "ATTEMPTS", "not owed") is None  # ambiguous
     assert normalize_path(t, "Nope", "x", "y") is None
 
 
-def test_prompt_text_deterministic():
+def _descriptions(t):
+    return pd.DataFrame({"label": t["label"], "description": [f"About {x}." for x in t["sub_issue"]]})
+
+
+def test_prompt_text_one_line_per_label_sorted():
     t = build_taxonomy(_complaints())
-    txt = taxonomy_prompt_text(t.sample(frac=1, random_state=1))
-    assert txt == taxonomy_prompt_text(t)
-    assert txt.count("Credit reporting") == 1
-    assert txt.count("Incorrect information") == 1
-    assert "Wrong name" in txt and "(none)" in txt
+    d = _descriptions(t)
+    txt = taxonomy_prompt_text(t.sample(frac=1, random_state=1), d.sample(frac=1, random_state=2))
+    assert txt == taxonomy_prompt_text(t, d)
+    lines = txt.splitlines()
+    assert len(lines) == len(t)
+    assert lines == sorted(lines)
+    assert "- Credit reporting|Incorrect information|Wrong name: About Wrong name." in lines
+    assert "(none)" not in txt
+
+
+def test_prompt_text_needs_every_description():
+    t = build_taxonomy(_complaints())
+    with pytest.raises(ValueError, match="description"):
+        taxonomy_prompt_text(t, _descriptions(t).iloc[1:])
+
+
+def test_normalize_label_exact_and_near_miss():
+    t = build_taxonomy(_complaints())
+    lab = "Credit reporting|Incorrect information|Wrong name"
+    assert normalize_label(t, lab) == lab
+    assert normalize_label(t, " credit REPORTING|Incorrect  information|wrong name ") == lab
+    assert normalize_label(t, "Credit reporting|Incorrect information|Nope") is None
+    assert normalize_label(t, "") is None
 
 
 def _counts(n_months=20, change_back=8):

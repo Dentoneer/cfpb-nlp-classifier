@@ -28,6 +28,18 @@ class ServiceUnavailable(Exception):
     """Provider overloaded (HTTP 5xx) or timed out. Nothing is billed; safe to retry later."""
 
 
+class RequestRejected(Exception):
+    """Google refused the request (HTTP 4xx other than 429). Never billed; retrying won't help.
+
+    `message` is already plain English and says what to do.
+    """
+
+    def __init__(self, status: int | None, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class GeminiClient(Protocol):
     def generate(
         self,

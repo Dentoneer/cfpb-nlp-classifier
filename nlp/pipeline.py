@@ -18,6 +18,7 @@ from nlp.config import Config
 from nlp.ensemble import ensemble_learned, ensemble_simple
 from nlp.llm.classify import run_classification
 from nlp.llm.client import GeminiClient
+from nlp.llm.describe import STAGE_DESCRIPTIONS
 from nlp.llm.jev import JevClient, v_jev
 from nlp.llm.jev import run_jev as _run_jev
 from nlp.llm.judge import SUMMARY_FIELDS, judge_summaries
@@ -45,6 +46,7 @@ LEVELS3 = ["product", "issue", "sub_issue"]
 STAGE_COMPLAINTS = "complaints"
 STAGE_TAXONOMY = "taxonomy"
 STAGE_SPLITS = "splits"
+__all__ = ["STAGE_DESCRIPTIONS"]  # re-exported: P.STAGE_DESCRIPTIONS
 STAGE_PRED_GEMINI = "pred_gemini"
 STAGE_PRED_GEMINI_SC2 = "pred_gemini_sc2"
 STAGE_PRED_GEMINI_SC3 = "pred_gemini_sc3"

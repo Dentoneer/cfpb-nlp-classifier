@@ -32,6 +32,8 @@ class Config:
     embed_model: str = "BAAI/bge-base-en-v1.5"
     likely_correct_threshold: float = 0.6
     jev_model: str = "jev-1.14.0"
+    describe_model: str = "gemini-3.8-flash"
+    data_version: str = "v2"
 
     @classmethod
     def load(cls, path: Path) -> Config:

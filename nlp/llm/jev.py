@@ -164,28 +164,19 @@ class FakeJevClient:
         return self.responder(model, state, questions)
 
 
-def build_jev_questions(
-    product: str, issue: str, sub_issue: str, issue_has_sub_issues: bool = True
-) -> dict[str, dict]:
+def build_jev_questions(product: str, issue: str, sub_issue: str) -> dict[str, dict]:
     """Testable claims about the complaint, one per hierarchy level.
 
-    No sub-issue question when Gemini says "(none)" and the issue has no sub-issues at all in
-    the taxonomy (nothing to check). Sub-issue claims name the issue so they stand alone.
+    Every category has a real sub-issue, so all three claims are always asked. Sub-issue
+    claims name the issue so they stand alone.
     """
     claims = {
         "product_ok": f'This complaint is about the financial product: "{product}".',
         "issue_ok": f'The main problem the consumer reports is: "{issue}".',
-    }
-    if str(sub_issue).strip() in ("", "(none)"):
-        if issue_has_sub_issues:
-            claims["sub_issue_ok"] = (
-                f'Within the issue "{issue}", no more specific sub-issue applies; '
-                "the issue alone describes this complaint."
-            )
-    else:
-        claims["sub_issue_ok"] = (
+        "sub_issue_ok": (
             f'Within the issue "{issue}", this complaint is specifically about: "{sub_issue}".'
-        )
+        ),
+    }
     return {k: {"type": "noul", "instructions": v} for k, v in claims.items()}
 
 
@@ -242,8 +233,7 @@ def run_jev(
     if the judged labels differ from the row's current labels. When the cap refuses a request,
     raises BudgetExceeded (finished rows stay cached); a daily-quota 429 raises
     DailyQuotaExhausted(remaining_rows).
-    `taxonomy` decides whether an issue has sub-issues; when it has none and Gemini says
-    "(none)", no sub-issue question is asked and sub_issue_ok is NaN for that row.
+    `taxonomy` is kept for interface stability (every category has a sub-issue now).
     """
     model = cfg.jev_model
     limiter = limiter or RateLimiter(cfg.rpm)
@@ -265,19 +255,11 @@ def run_jev(
             return None
         return rec
 
-    with_subs = {
-        (p, i)
-        for p, i, sub in zip(taxonomy["product"], taxonomy["issue"], taxonomy["sub_issue"])
-        if sub != "(none)"
-    }
-
     queue = [c for c in ids if fresh(c) is None]
     for i, cid in enumerate(queue):
         r = by_id[cid]
         state = clean_text(str(r["narrative"]), cfg.max_chars)
-        questions = build_jev_questions(
-            r["product"], r["issue"], r["sub_issue"], (r["product"], r["issue"]) in with_subs
-        )
+        questions = build_jev_questions(r["product"], r["issue"], r["sub_issue"])
         est_in = estimate_jev_tokens(state, questions)
         try:
             resp = _call_with_backoff(

@@ -23,7 +23,7 @@ from nlp.store import JsonlCache
 
 MODEL = "jev-1.14.0"
 TAX = pd.DataFrame(
-    {"product": ["P", "P"], "issue": ["I", "I2"], "sub_issue": ["S", "(none)"], "path_id": ["a", "b"]}
+    {"product": ["P", "P"], "issue": ["I", "I2"], "sub_issue": ["S", "S2"], "path_id": ["a", "b"]}
 )
 PRICES = {MODEL: (0.042, 0.0), "gemini-2.5-flash": (0.30, 2.50)}
 
@@ -73,33 +73,16 @@ def test_questions_three_claim_cases():
     assert q["sub_issue_ok"]["instructions"] == (
         'Within the issue "Trouble paying", this complaint is specifically about: "Foreclosure".'
     )
-    # (none) but the issue has sub-issues: claim that none applies
-    none = build_jev_questions("Mortgage", "Trouble paying", "(none)", True)
-    assert none["sub_issue_ok"]["instructions"] == (
-        'Within the issue "Trouble paying", no more specific sub-issue applies; '
-        "the issue alone describes this complaint."
-    )
-    # (none) and the issue has no sub-issues: no question
-    assert list(build_jev_questions("Mortgage", "Trouble paying", "(none)", False)) == [
-        "product_ok",
-        "issue_ok",
-    ]
+    assert "(none)" not in json.dumps(q) and "no more specific" not in json.dumps(q)
 
 
-def test_run_jev_skips_sub_issue_question_when_issue_has_none(cfg, tmp_path):
+def test_run_jev_always_asks_all_three_claims(cfg, tmp_path):
     client, ledger, cache, limiter = make(tmp_path)
     r = rows(2)
-    r["issue"] = "I2"
-    r["sub_issue"] = "(none)"  # TAX: I2 has no sub-issues
+    r["issue"], r["sub_issue"] = "I2", "S2"
     out = run_jev(r, cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
-    assert all(set(c[2]) == {"product_ok", "issue_ok"} for c in client.calls)
-    assert out["sub_issue_ok"].isna().all() and len(out) == 2
-    again = run_jev(r, cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
-    assert len(client.calls) == 2 and again["sub_issue_ok"].isna().all()
-    r2 = rows(1)
-    r2["sub_issue"] = "(none)"  # TAX: issue I has sub-issues -> claim asked
-    run_jev(r2, cfg, client, ledger, cache, taxonomy=TAX, limiter=limiter)
-    assert "no more specific sub-issue" in client.calls[-1][2]["sub_issue_ok"]["instructions"]
+    assert all(set(c[2]) == {"product_ok", "issue_ok", "sub_issue_ok"} for c in client.calls)
+    assert out["sub_issue_ok"].notna().all() and len(out) == 2
 
 
 def test_v_jev_missing_level_path_product():
@@ -395,7 +378,7 @@ def test_live_jev_call():
     key = os.environ.get("TYPESAFE_API_KEY")
     if not key:
         pytest.skip("TYPESAFE_API_KEY not set")
-    q = build_jev_questions("Mortgage", "Trouble during payment process", "(none)", True)
+    q = build_jev_questions("Mortgage", "Trouble during payment process", "Problem with additional add-on products or services purchased with the loan")
     state = "My mortgage servicer misapplied my last two payments and then charged late fees."
     r = HttpJevClient(key).system_one(MODEL, state, q)
     assert set(r.nouls) == set(QIDS) and all(0 <= v <= 1 for v in r.nouls.values())

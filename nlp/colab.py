@@ -20,13 +20,28 @@ from nlp import store
 from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter, estimate_run
 from nlp.config import Config
 from nlp.data import clean_text, load_clean
+from nlp.errors import StageIncomplete
 from nlp.llm.classify import build_prompt, estimate_request_tokens
-from nlp.llm.client import ServiceUnavailable
+from nlp.llm.client import GeminiClient, RequestRejected, ServiceUnavailable
+from nlp.llm.describe import (
+    STAGE_DESCRIPTIONS,
+    DescriptionError,
+    apply_edits,
+    descriptions_match,
+    run_descriptions,
+)
 from nlp.llm.jev import estimate_jev_usd
 from nlp.review import count_verdicts
-from nlp.sheets import read_review_sheet
+from nlp.sheets import (
+    publish_taxonomy,
+    read_description_edits,
+    read_review_sheet,
+    rewrite_taxonomy_sheet,
+)
 from nlp.store import JsonlCache
 from nlp.taxonomy import taxonomy_prompt_text
+
+__all__ = ["StageIncomplete"]  # defined in nlp.errors; notebooks use colab.StageIncomplete
 
 REPO_URL = "https://github.com/Dentoneer/cfpb-nlp-classifier"
 OVERRIDES_FILE = "config_overrides.json"
@@ -37,10 +52,9 @@ MAX_MISSING_FRAC = 0.02  # stage_paid saves a stage missing at most this share o
 DUCKDB_TMP = "/content/duckdb_tmp"  # local Colab disk DuckDB may spill to while filtering
 MEASURED_SAFETY = 1.5
 RESTART_MSG = "Restart session (Runtime menu \u2192 Restart session), then rerun this cell"
-
-
-class StageIncomplete(Exception):
-    """A paid or manual step did not finish; the message tells Marco what to do next."""
+# Stand-in for a not-yet-written description when estimating cost (a 45-word description is
+# about 300 characters; rounded up so the estimate stays conservative).
+PLACEHOLDER_DESCRIPTION = "x" * 400
 
 
 # --------------------------------------------------------------------------- config / setup
@@ -225,6 +239,11 @@ def stage_paid(
         ) from None
     except ServiceUnavailable as e:
         raise StageIncomplete(f"{e} Finished rows are saved - rerun this cell later.") from None
+    except RequestRejected as e:
+        raise StageIncomplete(
+            f"Google refused the request: {e.message} Nothing was charged for it. Finished "
+            "rows are saved."
+        ) from None
     got = set(df["complaint_id"].astype(str)) if len(df) else set()
     missing = sorted(want - got)
     if missing:
@@ -285,11 +304,15 @@ def estimate_classification(
     thinking: str | None = None,
     runs: int = 1,
 ) -> float:
-    """Conservative USD estimate (the same token estimate the spend guard reserves with)."""
+    """Conservative USD estimate (the same token estimate the spend guard reserves with).
+
+    Uses the saved category descriptions when they exist; before Part 0 has run, a
+    conservative stand-in description per category.
+    """
     model = model or cfg.classifier_model
     bs = batch_size or cfg.batch_size
     thinking = thinking or cfg.thinking
-    tax = taxonomy_prompt_text(taxonomy)
+    tax = taxonomy_prompt_text(taxonomy, _descriptions_for_estimate(cfg, taxonomy))
     text = [clean_text(str(t), cfg.max_chars) for t in rows["narrative"]]
     ids = [str(c) for c in rows["complaint_id"]]
     total = 0.0
@@ -299,6 +322,14 @@ def estimate_classification(
         est_in, est_out = estimate_request_tokens(system, user, len(batch), thinking)
         total += estimate_run(1, est_in, est_out, model, cfg.prices)
     return runs * total
+
+
+def _descriptions_for_estimate(cfg: Config, taxonomy: pd.DataFrame):
+    if store.exists(cfg, STAGE_DESCRIPTIONS):
+        d = store.read(cfg, STAGE_DESCRIPTIONS)
+        if descriptions_match(d, taxonomy):
+            return d
+    return {label: PLACEHOLDER_DESCRIPTION for label in taxonomy["label"]}
 
 
 def measured_usd_per_request(ledger: Ledger, model: str) -> float | None:
@@ -544,6 +575,81 @@ def pending_usd(
     if stages is not None:
         sel = sel[sel["stage"].isin(list(stages))]
     return float(sel[column].sum())
+
+
+def make_descriptions(
+    cfg: Config,
+    complaints: pd.DataFrame,
+    splits: pd.DataFrame,
+    taxonomy: pd.DataFrame,
+    client: GeminiClient,
+    ledger: Ledger,
+    cache: JsonlCache,
+    limiter: RateLimiter | None = None,
+) -> pd.DataFrame:
+    """Part 0: the saved descriptions stage, written by Gemini if missing or out of date.
+
+    Every paid answer is cached per product, so a rerun never pays twice. Stops (saving
+    nothing) with a plain-English StageIncomplete if the budget, the daily quota, an outage or
+    a refused request gets in the way.
+    """
+    if store.exists(cfg, STAGE_DESCRIPTIONS):
+        d = store.read(cfg, STAGE_DESCRIPTIONS)
+        if descriptions_match(d, taxonomy):
+            return d
+    try:
+        d = run_descriptions(complaints, splits, taxonomy, cfg, client, ledger, cache,
+                             limiter=limiter)  # fmt: skip
+    except DailyQuotaExhausted:
+        raise StageIncomplete(
+            "Gemini's daily request quota is used up. Finished products are saved - rerun this "
+            "cell tomorrow."
+        ) from None
+    except BudgetExceeded as e:
+        raise StageIncomplete(
+            f"Budget reached. Nothing more was spent. ({e}) Finished products are saved."
+        ) from None
+    except ServiceUnavailable as e:
+        raise StageIncomplete(f"{e} Finished products are saved - rerun this cell later.") from None
+    except RequestRejected as e:
+        raise StageIncomplete(
+            f"Google refused the request: {e.message} Nothing was charged for it."
+        ) from None
+    except DescriptionError:
+        raise
+    store.write(cfg, STAGE_DESCRIPTIONS, d)
+    print(f"{len(d)} category descriptions written. {ledger_report(ledger)}")
+    return d
+
+
+def publish_descriptions(cfg: Config, gc, taxonomy: pd.DataFrame, descriptions: pd.DataFrame) -> str:
+    """Show the descriptions in the taxonomy Google Sheet (label, product, issue, sub_issue,
+    description); creates the Sheet first if notebook 01 has not."""
+    url = publish_once(cfg, "taxonomy", lambda: publish_taxonomy(gc, taxonomy))
+    rewrite_taxonomy_sheet(gc, url, taxonomy, descriptions)
+    print("Taxonomy sheet with descriptions:", url)
+    return url
+
+
+def load_description_edits(cfg: Config, gc, taxonomy: pd.DataFrame) -> pd.DataFrame:
+    """Read Marco's edits from the taxonomy Sheet and save them as the descriptions stage."""
+    if not store.exists(cfg, STAGE_DESCRIPTIONS):
+        raise StageIncomplete("No descriptions yet - run the Part 0 cells above first.")
+    current = store.read(cfg, STAGE_DESCRIPTIONS)
+    try:
+        edits = read_description_edits(gc, read_url(cfg, "taxonomy"))
+    except ValueError as e:
+        raise StageIncomplete(str(e)) from None
+    new = apply_edits(current, edits)
+    changed = int((new["description"] != current["description"]).sum())
+    store.write(cfg, STAGE_DESCRIPTIONS, new)
+    print(
+        f"{changed} description(s) changed and saved. Every later Gemini run uses them "
+        "(answers given with the old wording are not reused)."
+        if changed
+        else "No description changed."
+    )
+    return new
 
 
 def load_human_review(cfg: Config, gc, url: str, allow_partial: bool = False) -> pd.DataFrame:

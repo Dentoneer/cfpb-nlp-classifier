@@ -3,9 +3,12 @@ import pytest
 
 from nlp.schema import HUMAN_REVIEW_COLS, TAXONOMY_COLS, VERDICTS
 from nlp.sheets import (
+    TAXONOMY_SHEET_COLS,
     publish_taxonomy,
+    read_description_edits,
     read_review_sheet,
     read_taxonomy,
+    rewrite_taxonomy_sheet,
     taxonomy_snapshot_hash,
     write_review_sheet,
 )
@@ -20,6 +23,9 @@ class FakeWorksheet:
 
     def update(self, values, range_name=None):
         self.values = [list(r) for r in values]
+
+    def clear(self):
+        self.values = []
 
     def get_all_records(self, numericise_ignore=()):
         if not self.values:
@@ -61,7 +67,7 @@ def _tax():
         {
             "product": ["A", "A", "B"],
             "issue": ["i1", "i2", "i3"],
-            "sub_issue": ["(none)", "s", "(none)"],
+            "sub_issue": ["s0", "s", "s3"],
         }
     )
     return build_taxonomy(df)
@@ -87,9 +93,48 @@ def test_read_taxonomy_rejects_duplicates():
 def test_read_taxonomy_rejects_blank_product_or_issue():
     gc = FakeGC()
     url = publish_taxonomy(gc, _tax())
-    gc.books[url].sheet1.values[1][0] = "  "
+    ws = gc.books[url].sheet1
+    ws.values[1][ws.values[0].index("product")] = "  "
     with pytest.raises(ValueError, match="blank"):
         read_taxonomy(gc, url)
+
+
+def test_published_taxonomy_has_label_column_first():
+    gc = FakeGC()
+    url = publish_taxonomy(gc, _tax())
+    vals = gc.books[url].sheet1.values
+    assert vals[0] == TAXONOMY_SHEET_COLS == ["label", "product", "issue", "sub_issue"]
+    assert vals[1][0] == "A|i1|s0"
+
+
+def test_read_taxonomy_rejects_blank_sub_issue():
+    gc = FakeGC()
+    url = publish_taxonomy(gc, _tax())
+    ws = gc.books[url].sheet1
+    ws.values[1][ws.values[0].index("sub_issue")] = ""
+    with pytest.raises(ValueError, match="sub-issue"):
+        read_taxonomy(gc, url)
+
+
+def _desc(t):
+    return pd.DataFrame({"label": t["label"], "description": [f"d {x}" for x in t["label"]],
+                         "model_id": "m", "describe_version": "d1"})
+
+
+def test_rewrite_taxonomy_sheet_adds_descriptions_and_reads_edits():
+    gc = FakeGC()
+    t = _tax()
+    url = publish_taxonomy(gc, t)
+    gc.books[url].sheet1.values.append(["stale", "row", "x", "y"])
+    rewrite_taxonomy_sheet(gc, url, t, _desc(t))
+    vals = gc.books[url].sheet1.values
+    assert vals[0] == ["label", "product", "issue", "sub_issue", "description"]
+    assert len(vals) == len(t) + 1  # stale rows are gone
+    vals[1][4] = "  Edited by Marco.  "
+    edits = read_description_edits(gc, url)
+    assert list(edits.columns) == ["label", "description"]
+    assert edits.iloc[0]["description"] == "Edited by Marco."
+    assert len(edits) == len(t)
 
 
 def test_snapshot_hash_order_independent():
@@ -107,10 +152,10 @@ def _wide():
             "narrative": ["n1", "n2"],
             "cfpb_product": ["A", "B"],
             "cfpb_issue": ["i1", "i3"],
-            "cfpb_sub_issue": ["(none)", "(none)"],
+            "cfpb_sub_issue": ["s0", "s3"],
             "gemini_product": ["A", "A"],
             "gemini_issue": ["i1", "i2"],
-            "gemini_sub_issue": ["(none)", "s"],
+            "gemini_sub_issue": ["s0", "s"],
             "gemini_summary": ["s1", "s2"],
             "verdict_product": ["model right", ""],
             "verdict_issue": ["both OK", "ambiguous"],

@@ -15,10 +15,10 @@ from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter
 from nlp.config import Config
 from nlp.data import clean_text
 from nlp.llm.client import GeminiClient, RateLimited, ServiceUnavailable
-from nlp.schema import PREDICTIONS_COLS
+from nlp.schema import PREDICTIONS_COLS, split_label
 from nlp.sheets import taxonomy_snapshot_hash
 from nlp.store import JsonlCache
-from nlp.taxonomy import normalize_path, taxonomy_prompt_text
+from nlp.taxonomy import normalize_label, taxonomy_prompt_text
 
 T = TypeVar("T")
 _STR = {"type": "string"}
@@ -28,13 +28,11 @@ RESPONSE_SCHEMA: dict = {
         "type": "object",
         "properties": {
             "complaint_id": _STR,
-            "product": _STR,
-            "issue": _STR,
-            "sub_issue": _STR,
+            "label": _STR,
             "summary": _STR,
             "confidence": {"type": "number"},
         },
-        "required": ["complaint_id", "product", "issue", "sub_issue", "summary", "confidence"],
+        "required": ["complaint_id", "label", "summary", "confidence"],
     },
 }
 
@@ -47,19 +45,26 @@ _PARSED_COLS = [
 
 
 def build_prompt(batch: pd.DataFrame, taxonomy_text: str, prompt_version: str) -> tuple[str, str]:
-    """Return (system, user). `batch` needs complaint_id and (already cleaned) narrative."""
+    """Return (system, user). `batch` needs complaint_id and (already cleaned) narrative.
+
+    `taxonomy_text` is the category listing from `taxonomy_prompt_text` (one line per label
+    with its description).
+    """
     system = (
         f"[prompt {prompt_version}] You classify US consumer financial complaints.\n"
-        "Classify each complaint into exactly one path (Product, Issue, Sub-issue) from the "
-        "taxonomy below. Copy the Product, Issue and Sub-issue strings exactly as written; "
-        'use the sub-issue "(none)" only where the taxonomy lists it.\n'
+        "Each line of the CATEGORIES list below is one category: its label "
+        "(Product|Issue|Sub-issue), a colon, then a description of what it covers and when to "
+        "use it. Read the descriptions to tell similar categories apart.\n"
+        "For each complaint choose exactly one label from the list and copy it verbatim: the "
+        "whole text between \"- \" and the colon, with the | separators exactly as written. Never "
+        "invent or shorten a label.\n"
         "For each complaint also write a summary of at most 60 words that uses only facts "
         "stated in the complaint text (no guesses, no outside knowledge), and a confidence "
-        "between 0 and 1 that the chosen path is correct.\n"
+        "between 0 and 1 that the chosen label is correct.\n"
         "Return a JSON array with one object per complaint, following the response schema "
-        "(complaint_id, product, issue, sub_issue, summary, confidence). Use the given "
-        "complaint_id values unchanged and include every complaint exactly once.\n\n"
-        f"TAXONOMY:\n{taxonomy_text}"
+        "(complaint_id, label, summary, confidence). Use the given complaint_id values unchanged "
+        "and include every complaint exactly once.\n\n"
+        f"CATEGORIES:\n{taxonomy_text}"
     )
     parts = [
         f"complaint_id: {cid}\nnarrative: {text}"
@@ -96,7 +101,9 @@ def parse_and_validate(
 ) -> tuple[pd.DataFrame, list[str]]:
     """Return (valid rows with exact taxonomy strings, ids to retry).
 
-    Invalid path or confidence, or missing id -> retry; duplicate id -> first valid-or-not
+    The answer's `label` must match a taxonomy label exactly or after normalization (case,
+    whitespace, quotes); it is then split into product, issue and sub_issue. Invalid label or
+    confidence, or missing id -> retry; duplicate id -> first valid-or-not
     occurrence wins; unknown id -> ignored. Unparseable output retries every id.
     """
     try:
@@ -115,16 +122,11 @@ def parse_and_validate(
         if cid not in wanted or cid in seen:
             continue
         seen.add(cid)
-        sub = it.get("sub_issue")
-        path = normalize_path(
-            taxonomy,
-            it.get("product") or "",
-            it.get("issue") or "",
-            "(none)" if sub is None or str(sub).strip() == "" else sub,
-        )
+        label = normalize_label(taxonomy, it.get("label"))
         conf = _confidence(it.get("confidence"))
-        if path is None or conf is None:
+        if label is None or conf is None:
             continue
+        path = split_label(label)
         good.append(
             {
                 "complaint_id": cid,
@@ -251,10 +253,15 @@ def run_classification(
     thinking: str | None = None,
     *,
     taxonomy: pd.DataFrame,
+    descriptions: pd.DataFrame | None = None,
     limiter: RateLimiter | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> pd.DataFrame:
     """Classify `rows` (complaint_id, narrative) sequentially; resumable via `cache`.
+
+    `descriptions` (label, description) default to the saved descriptions stage; without one,
+    raises DescriptionsMissing ("Run Part 0 (descriptions) in notebook 03 first."). The
+    recorded prompt_version (and cache key) is `<prompt_version>+<descriptions fingerprint>`.
 
     Per request: reserve -> limiter.wait -> generate -> ledger.record -> cache.put per row.
     Returns every cached prediction for `rows`. When the cap stops the run, raises
@@ -265,7 +272,14 @@ def run_classification(
     prompt_version = prompt_version or cfg.prompt_version
     thinking = thinking or cfg.thinking
     limiter = limiter or RateLimiter(cfg.rpm)
-    tax_text = taxonomy_prompt_text(taxonomy)
+    from nlp.llm.describe import descriptions_fingerprint, load_descriptions  # avoids a cycle
+
+    if descriptions is None:
+        descriptions = load_descriptions(cfg, taxonomy)
+    tax_text = taxonomy_prompt_text(taxonomy, descriptions)
+    # The recorded version names the exact description wording, so answers given with older
+    # (e.g. since edited) descriptions are never reused from the cache.
+    prompt_version = f"{prompt_version}+{descriptions_fingerprint(descriptions)}"
     tax_hash = taxonomy_snapshot_hash(taxonomy)
 
     def key(cid: str) -> str:
