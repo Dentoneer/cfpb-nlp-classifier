@@ -7,8 +7,8 @@ _Last updated: 2026-10-27_
   Final whole-branch review done ("with fixes"); all 12 fixes committed in `fff1a90` (data load
   filters inside DuckDB, cleanlab missing-row crash, explicit budget-stop exception, 5xx/timeout
   retries, summary-judge section in results, Jev ids in nb 04, model fingerprint includes
-  training rows, config price validation). Scoped re-review clean (all 12 addressed). Next: one PR
-  to `main` (awaiting Marco's go-ahead to push).
+  training rows, config price validation). Scoped re-review clean (all 12 addressed). PR #2
+  (https://github.com/Dentoneer/cfpb-nlp-classifier/pull/2) open → `main`, waiting on CI + Marco's merge.
   Notebooks clone `main`, so the PR must be merged before Marco can run them.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
@@ -43,7 +43,7 @@ _Last updated: 2026-10-27_
 - Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Finish: push `feat/phase1-nlp`, open PR → `main`; Marco merges.
+- Finish: Marco merges PR #2 once CI is green.
 - Known, accepted limits: a timeout after Gemini already billed may under-count the ledger by
   ≤1 request; a 429 that persists through 5 retries surfaces as a raw `RateLimited` error;
   peak memory of notebook 01 on the full mirror is unmeasured (DuckDB spills to
