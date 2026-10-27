@@ -2,13 +2,14 @@ import json
 from pathlib import Path
 
 from nlp.llm.client import FakeClient
-from nlp.smoke import make_fake_client, run_smoke
+from nlp.smoke import make_fake_client, make_fake_jev_client, run_smoke
 
 
 def test_smoke_end_to_end(tmp_path: Path):
     art = tmp_path / "artifacts"
     client = make_fake_client()
-    out = run_smoke(art, client=client)
+    jev = make_fake_jev_client()
+    out = run_smoke(art, client=client, jev_client=jev)
 
     assert isinstance(out["go"], bool)
     assert out["n_classifiers"] == 4 and out["n_levels"] == 4
@@ -17,14 +18,15 @@ def test_smoke_end_to_end(tmp_path: Path):
     assert 0 < out["spend_usd"] <= 4.00
     assert len(client.calls) > 0
     assert out["gemini_path_accuracy"] > 0.8
-    assert out["jeb_path_catch_rate"] > 0.5
+    assert out["jev_path_catch_rate"] > 0.5
+    assert len(jev.calls) == 400 and {m for m, *_ in jev.calls} == {"jev-1.14.0"}  # 1 per test row
     assert set(out["adjusted"]) == {"product", "issue", "sub_issue", "path"}
     assert {m for m, *_ in client.calls} == {"gemini-2.5-flash", "gemini-3.1-flash-lite"}
 
     # Resume: everything is read back from Parquet / caches, zero new Gemini calls.
-    before = len(client.calls)
-    again = run_smoke(art, client=client)
-    assert len(client.calls) == before
+    before, jbefore = len(client.calls), len(jev.calls)
+    again = run_smoke(art, client=client, jev_client=jev)
+    assert len(client.calls) == before and len(jev.calls) == jbefore
     assert again["spend_usd"] == out["spend_usd"]
     assert json.dumps(again["go"]) == json.dumps(out["go"])
 
@@ -32,13 +34,13 @@ def test_smoke_end_to_end(tmp_path: Path):
 def test_smoke_cache_alone_prevents_calls(tmp_path: Path):
     """Even with the Parquet stages deleted, the JSONL caches make a rerun free."""
     art = tmp_path / "artifacts"
-    client = make_fake_client()
-    run_smoke(art, client=client)
-    before = len(client.calls)
+    client, jev = make_fake_client(), make_fake_jev_client()
+    run_smoke(art, client=client, jev_client=jev)
+    before, jbefore = len(client.calls), len(jev.calls)
     for p in Path(art).glob("*.parquet"):
         p.unlink()
-    run_smoke(art, client=client)
-    assert len(client.calls) == before
+    run_smoke(art, client=client, jev_client=jev)
+    assert len(client.calls) == before and len(jev.calls) == jbefore
 
 
 def test_fake_client_type():
@@ -52,6 +54,6 @@ def test_fake_responder_rejects_drifted_prompts():
     schema = {"items": {"properties": {"product": {}}}}
     with pytest.raises(ValueError):
         client.generate("m", "sys", "no ids here", schema, "low", 100)
-    jeb = {"items": {"properties": {"product_ok": {}}}}
+    jev = make_fake_jev_client()
     with pytest.raises(ValueError):
-        client.generate("m", "sys", "complaint_id: c00001\nnarrative: x", jeb, "low", 100)
+        jev.system_one("jev-1.14.0", "unknown narrative", {})

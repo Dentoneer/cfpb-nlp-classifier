@@ -21,6 +21,7 @@ from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter,
 from nlp.config import Config
 from nlp.data import clean_text, load_clean
 from nlp.llm.classify import build_prompt, estimate_request_tokens
+from nlp.llm.jev import estimate_jev_usd
 from nlp.review import count_verdicts
 from nlp.sheets import read_review_sheet
 from nlp.store import JsonlCache
@@ -131,20 +132,25 @@ def setup(
     repo_dir: str = "/content/cfpb-nlp-classifier",
     drive_subdir: str = "cfpb-nlp-classifier/phase1",
 ):
-    """Mount Drive, load config, fetch the Gemini key, authorise Sheets -> (cfg, gc, api_key)."""
+    """Mount Drive, load config, fetch the Gemini and Jev keys, authorise Sheets.
+
+    Returns (cfg, gc, api_key, jev_key).
+    """
     check_code_fresh(_HEAD_AT_IMPORT, _git_head(Path(repo_dir)))
     from google.colab import auth, drive, userdata
 
     drive.mount("/content/drive")
     artifacts = Path("/content/drive/MyDrive") / drive_subdir
     cfg = load_config(Path(repo_dir) / "config" / "phase1.yaml", artifacts)
-    try:
-        api_key = userdata.get("GEMINI_API_KEY")
-    except Exception as e:  # secret missing or notebook access not granted
-        raise RuntimeError(
-            "GEMINI_API_KEY not found. In Colab open the key icon (Secrets) on the left, add "
-            "GEMINI_API_KEY and switch 'Notebook access' on."
-        ) from e
+    keys = {}
+    for secret in ("GEMINI_API_KEY", "TYPESAFE_API_KEY"):
+        try:
+            keys[secret] = userdata.get(secret)
+        except Exception as e:  # secret missing or notebook access not granted
+            raise RuntimeError(
+                f"{secret} not found. In Colab open the key icon (Secrets) on the left, add "
+                f"{secret} and switch 'Notebook access' on."
+            ) from e
     auth.authenticate_user()
     import google.auth
     import gspread
@@ -154,7 +160,7 @@ def setup(
     print(f"Ready. Outputs go to {artifacts}")
     print(f"Saved choices applied: {read_overrides(artifacts) or 'none yet'}")
     print(f"Classifier {cfg.classifier_model} | judge {cfg.judge_model} | cap ${cfg.spend_cap_usd:.2f}")
-    return cfg, gc, api_key
+    return cfg, gc, keys["GEMINI_API_KEY"], keys["TYPESAFE_API_KEY"]
 
 
 def open_tools(cfg: Config) -> tuple[Ledger, JsonlCache, JsonlCache, RateLimiter]:
@@ -336,7 +342,7 @@ def check_fits(
 def ledger_report(ledger: Ledger) -> str:
     spent = ledger.spent()
     return (
-        f"Gemini spend so far: ${spent:.2f} of ${ledger.cap_usd:.2f} cap "
+        f"Paid spend so far (Gemini + Jev): ${spent:.2f} of ${ledger.cap_usd:.2f} cap "
         f"(${ledger.cap_usd - spent:.2f} remaining)"
     )
 
@@ -387,7 +393,7 @@ def results_markdown(scored: dict, spent_usd: float, cap_usd: float) -> str:
         "### Validator leaderboard",
         _md_table(scored["validator_board"]),
         "",
-        f"**Total Gemini spend: ${spent_usd:.2f}** of the ${cap_usd:.2f} cap.",
+        f"**Total paid spend (Gemini + Jev): ${spent_usd:.2f}** of the ${cap_usd:.2f} cap.",
     ]
     return "\n".join(lines)
 
@@ -469,13 +475,17 @@ def phase_estimate(
         (P.STAGE_PRED_GEMINI, "Test classification", test_df, cfg.classifier_model),
         (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2", sc_rows, cfg.classifier_model),
         (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3", sc_rows, cfg.classifier_model),
-        (P.STAGE_JEB, "JEB judge, full test", test_df, judge),
+        (P.STAGE_JEV, "Jev validator, full test", test_df, cfg.jev_model),
         (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows", hc, judge),
     ]
     out = []
     for stage, label, rows, model in spec:
-        bound = estimate_classification(cfg, rows, taxonomy, model=model)
-        meas = estimate_measured(cfg, ledger, rows, model=model)
+        if model == cfg.jev_model:  # one request per complaint, input-only pricing
+            bound = estimate_jev_usd(cfg, rows, model)
+            meas = estimate_measured(cfg, ledger, rows, model=model, batch_size=1)
+        else:
+            bound = estimate_classification(cfg, rows, taxonomy, model=model)
+            meas = estimate_measured(cfg, ledger, rows, model=model)
         out.append(
             (stage, label, bound, bound if meas is None else min(meas, bound),
              meas is not None, store.exists(cfg, stage))

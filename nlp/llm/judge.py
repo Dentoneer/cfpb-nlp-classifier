@@ -1,6 +1,6 @@
-"""JEB judge (a second model checks Gemini's classification) and summary judge.
+"""Summary judge (a second Gemini model checks the summaries).
 
-Both reuse the sequential, spend-safe request loop of the classifier runner
+Reuses the sequential, spend-safe request loop of the classifier runner
 (`nlp.llm.classify.run_queue`): reserve -> wait -> generate -> ledger.record -> cache.put.
 """
 
@@ -17,14 +17,11 @@ from nlp.config import Config
 from nlp.data import clean_text
 from nlp.llm.classify import run_queue
 from nlp.llm.client import GeminiClient
-from nlp.schema import VALIDATOR_RESULTS_COLS
 from nlp.store import JsonlCache
 
 _BOOL = {"type": "boolean"}
 _STR = {"type": "string"}
-JEB_FIELDS = ["product_ok", "issue_ok", "sub_issue_ok"]
 SUMMARY_FIELDS = ["faithful", "covers_main_issue", "invented_details"]
-JEB_PROMPT_VERSION = "jeb-v1"
 SUMMARY_JUDGE_PROMPT_VERSION = "sj-v1"
 
 
@@ -39,7 +36,6 @@ def _schema(fields: list[str]) -> dict:
     }
 
 
-JEB_SCHEMA = _schema(JEB_FIELDS)
 SUMMARY_SCHEMA = _schema(SUMMARY_FIELDS)
 
 
@@ -139,59 +135,6 @@ def _run(
     if failed:
         print(f"{len(failed)} row(s) failed {tag} validation after retries; left absent.")
     return [v for c in ids if (v := fresh(c)) is not None]
-
-
-_JEB_SYSTEM = (
-    "You are an independent judge of US consumer financial complaint classification. "
-    "For each complaint you are shown another model's chosen Product, Issue and Sub-issue. "
-    "Decide separately whether each chosen value is correct for the complaint text "
-    "(product_ok, issue_ok, sub_issue_ok). Judge only against the complaint text. "
-    "Return a JSON array with one object per complaint (complaint_id, product_ok, issue_ok, "
-    "sub_issue_ok), using the given complaint_id values unchanged."
-)
-
-
-def judge_classifications(
-    rows: pd.DataFrame,
-    cfg: Config,
-    client: GeminiClient,
-    ledger: Ledger,
-    cache: JsonlCache,
-    model: str | None = None,
-    *,
-    limiter: RateLimiter | None = None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> pd.DataFrame:
-    """JEB: `rows` = complaint_id, narrative, product, issue, sub_issue (Gemini's labels).
-
-    Returns validator_results rows (validator `jeb`, score 1.0/0.0) for product, issue,
-    sub_issue, and path (all three ok).
-    """
-    model = _check_model(cfg, model)
-
-    def render(r: pd.Series, text: str) -> str:
-        return (
-            f"complaint_id: {r['complaint_id']}\nnarrative: {text}\n"
-            f"chosen product: {r['product']}\nchosen issue: {r['issue']}\n"
-            f"chosen sub_issue: {r['sub_issue']}"
-        )
-
-    recs = _run(
-        rows, cfg, client, ledger, cache, tag="jeb", prompt_version=JEB_PROMPT_VERSION,
-        inputs=["product", "issue", "sub_issue"], model=model, fields=JEB_FIELDS,
-        schema=JEB_SCHEMA, system=_JEB_SYSTEM, render=render, limiter=limiter, sleep=sleep,
-    )  # fmt: skip
-    out = []
-    for r in recs:
-        flags = {
-            "product": r["product_ok"],
-            "issue": r["issue_ok"],
-            "sub_issue": r["sub_issue_ok"],
-        }
-        flags["path"] = all(flags.values())
-        for level, ok in flags.items():
-            out.append((r["complaint_id"], "jeb", level, bool(ok), 1.0 if ok else 0.0))
-    return pd.DataFrame(out, columns=VALIDATOR_RESULTS_COLS)
 
 
 _SUMMARY_SYSTEM = (

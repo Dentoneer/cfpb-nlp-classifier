@@ -1,8 +1,8 @@
-"""Synthetic end-to-end smoke run: every pipeline stage, fake Gemini, fake embeddings.
+"""Synthetic end-to-end smoke run: every pipeline stage, fake Gemini, fake Jev, fake embeddings.
 
 `run_smoke(artifacts_dir)` generates 3,000 synthetic complaints (6 products / 25 issues /
 40 sub-issues, keyword-bearing text) and runs the real pipeline code on them: splits ->
-TF-IDF / embed-LR / kNN -> Gemini classification (+ self-consistency) -> validators and judges
+TF-IDF / embed-LR / kNN -> Gemini classification (+ self-consistency) -> validators (Jev) and summary judge
 -> simulated human verdicts -> ensembles -> leaderboards -> go/no-go. Every stage goes through
 `store.stage` and every paid call through the JSONL caches, so a rerun makes zero API calls.
 ModernBERT is skipped. Needs only the `.[dev]` dependencies (no torch).
@@ -23,8 +23,10 @@ from nlp.budget import Ledger, RateLimiter
 from nlp.classifiers.embed import EmbedKNN, EmbedLR, FakeEncoder
 from nlp.classifiers.tfidf import TfidfLR
 from nlp.config import Config
+from nlp.data import clean_text
 from nlp.ensemble import row_status
 from nlp.llm.client import FakeClient, GeminiClient, LLMResponse
+from nlp.llm.jev import FakeJevClient, JevClient, JevResponse
 from nlp.review import select_hand_check
 from nlp.sampling import make_splits
 from nlp.schema import COMPLAINTS_COLS, HUMAN_REVIEW_COLS
@@ -40,9 +42,7 @@ PRODUCTS = [
 ISSUES_PER_PRODUCT = [5, 4, 4, 4, 4, 4]  # 25 issues
 N_TWO_SUB_ISSUES = 15  # 15 issues x 2 sub-issues + 10 issues x "(none)" = 40 paths
 _REQ_ID = re.compile(r"^complaint_id: (\S+)$", re.MULTILINE)
-_CHOSEN = re.compile(
-    r"chosen product: (.*)\nchosen issue: (.*)\nchosen sub_issue: (.*)", re.MULTILINE
-)  # fmt: skip
+_QUOTED = re.compile(r"'(.*)'")
 
 
 def smoke_config(artifacts_dir: Path) -> Config:
@@ -62,7 +62,11 @@ def smoke_config(artifacts_dir: Path) -> Config:
         self_consistency_n=60,
         batch_size=10,
         spend_cap_usd=4.00,
-        prices={"gemini-2.5-flash": (0.30, 2.50), "gemini-3.1-flash-lite": (0.25, 1.50)},
+        prices={
+            "gemini-2.5-flash": (0.30, 2.50),
+            "gemini-3.1-flash-lite": (0.25, 1.50),
+            "jev-1.14.0": (0.042, 0.0),
+        },
     )
 
 
@@ -106,7 +110,7 @@ def synthetic_data() -> tuple[pd.DataFrame, dict[str, tuple[str, str, str]]]:
 
 
 def make_fake_client(error_rate: float = 0.10) -> FakeClient:
-    """FakeClient whose responder plays classifier (90% correct), JEB judge, summary judge."""
+    """FakeClient whose responder plays classifier (90% correct) and summary judge."""
     _, truth = synthetic_data()
     all_paths = sorted(set(truth.values()))
     seen_count: dict[str, int] = {}  # per-complaint classification count -> varied reruns
@@ -129,16 +133,6 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
             "confidence": round(conf, 3),
         }  # fmt: skip
 
-    def jeb_one(cid: str, block: str) -> dict:
-        r = random.Random(f"{cid}|jeb")
-        m = _CHOSEN.search(block)
-        if not m:
-            raise ValueError(f"fake judge could not parse chosen labels: {block!r}")
-        chosen = [g.strip() for g in m.groups()]
-        flags = [c == t for c, t in zip(chosen, truth[cid])]
-        flags = [f != (r.random() < 0.08) for f in flags]  # judge is right ~92% of the time
-        return dict(zip(["complaint_id", "product_ok", "issue_ok", "sub_issue_ok"], [cid, *flags]))
-
     def summary_one(cid: str) -> dict:
         r = random.Random(f"{cid}|sj")
         return {
@@ -157,9 +151,7 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
             if not m:
                 continue  # preamble block has no complaint id
             cid = m.group(1)
-            if "product_ok" in props:
-                items.append(jeb_one(cid, b))
-            elif "faithful" in props:
+            if "faithful" in props:
                 items.append(summary_one(cid))
             else:
                 items.append(classify_one(cid))
@@ -173,6 +165,32 @@ def make_fake_client(error_rate: float = 0.10) -> FakeClient:
         )
 
     return FakeClient(responder)
+
+
+def make_fake_jev_client() -> FakeJevClient:
+    """FakeJevClient: answers each claim from synthetic ground truth, right ~92% of the time."""
+    data, truth = synthetic_data()
+    by_text = {clean_text(n, 6000): c for c, n in zip(data["complaint_id"], data["narrative"])}
+    assert len(by_text) == len(data), "synthetic narratives must be unique"
+    index = {"product_ok": 0, "issue_ok": 1, "sub_issue_ok": 2}
+
+    def responder(model: str, state: str, questions: dict) -> JevResponse:
+        if state not in by_text:
+            raise ValueError(f"fake Jev got an unknown narrative; prompt drifted: {state[:80]!r}")
+        cid = by_text[state]
+        nouls = {}
+        for qid, q in questions.items():
+            text = q["instructions"]
+            m = _QUOTED.search(text)
+            claimed = m.group(1) if m else "(none)"  # no quoted label -> "(none)" claim
+            yes = claimed == truth[cid][index[qid]]
+            r = random.Random(f"{cid}|jev|{qid}")
+            yes = yes != (r.random() < 0.08)  # judge is wrong ~8% of the time
+            nouls[qid] = round(r.uniform(0.75, 0.98) if yes else r.uniform(0.02, 0.25), 3)
+        tokens = len(json.dumps({"state": state, "questions": questions})) // 4
+        return JevResponse(nouls, tokens, 0, model)
+
+    return FakeJevClient(responder)
 
 
 def simulate_human_review(
@@ -200,12 +218,17 @@ def simulate_human_review(
     return pd.DataFrame(rows, columns=HUMAN_REVIEW_COLS)
 
 
-def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
+def run_smoke(
+    artifacts_dir: Path,
+    client: GeminiClient | None = None,
+    jev_client: JevClient | None = None,
+) -> dict:
     """Run every stage on synthetic data; resumable. Returns go/no-go plus board shapes."""
     cfg = smoke_config(Path(artifacts_dir))
     art = Path(cfg.artifacts_dir)
     art.mkdir(parents=True, exist_ok=True)
     client = client or make_fake_client()
+    jev_client = jev_client or make_fake_jev_client()
     ledger = Ledger(art / "ledger.jsonl", cfg.spend_cap_usd, cfg.prices)
     gem_cache = store.JsonlCache(art / "gemini_cache.jsonl")
     judge_cache = store.JsonlCache(art / "judge_cache.jsonl")
@@ -258,8 +281,9 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
     )
 
     # --- validators ---
-    jeb = S(
-        P.STAGE_JEB, lambda: P.run_jeb(cfg, gem, test_df, client, ledger, judge_cache, limiter)
+    jev = S(
+        P.STAGE_JEV,
+        lambda: P.run_jev(cfg, gem, test_df, jev_client, ledger, judge_cache, limiter),
     )
     summary_flags = S(
         P.STAGE_SUMMARY_JUDGE,
@@ -273,7 +297,7 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
     )
     vres = S(
         P.STAGE_VALIDATORS,
-        lambda: P.build_validator_results(complaints, taxonomy, gem, [sc2, sc3], probs, clean, jeb),
+        lambda: P.build_validator_results(complaints, taxonomy, gem, [sc2, sc3], probs, clean, jev),
     )
 
     # --- simulated human verdicts, ensembles, row status ---
@@ -299,7 +323,7 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
     )  # fmt: skip
     clf_board, adjusted = scored["classifier_board"], scored["adjusted"]
     val_board = scored["validator_board"]
-    jeb_path = val_board[(val_board["validator"] == "jeb") & (val_board["level"] == "path")]
+    jev_path = val_board[(val_board["validator"] == "jev") & (val_board["level"] == "path")]
     return {
         **scored["decision"],
         "classifiers": sorted(clf_board["classifier"].unique()),
@@ -310,7 +334,7 @@ def run_smoke(artifacts_dir: Path, client: GeminiClient | None = None) -> dict:
         "n_validators": int(val_board["validator"].nunique()),
         "adjusted": adjusted.set_index("level")["value"].to_dict(),
         "gemini_path_accuracy": _board_value(clf_board, "gemini", "path", "accuracy"),
-        "jeb_path_catch_rate": float(jeb_path["catch_rate"].iloc[0]),
+        "jev_path_catch_rate": float(jev_path["catch_rate"].iloc[0]),
         "status_counts": status["status"].value_counts().to_dict(),
         "summary_ok_share": float(summary_flags["faithful"].mean()),
         "spend_usd": ledger.spent(),

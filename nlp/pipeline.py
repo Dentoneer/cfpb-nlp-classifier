@@ -18,7 +18,9 @@ from nlp.config import Config
 from nlp.ensemble import ensemble_learned, ensemble_simple
 from nlp.llm.classify import run_classification
 from nlp.llm.client import GeminiClient
-from nlp.llm.judge import judge_classifications, judge_summaries
+from nlp.llm.jev import JevClient, v_jev
+from nlp.llm.jev import run_jev as _run_jev
+from nlp.llm.judge import judge_summaries
 from nlp.metrics import inverse_weights
 from nlp.review import agree_path, is_correct
 from nlp.schema import VALIDATOR_RESULTS_COLS, path_id
@@ -47,7 +49,7 @@ STAGE_PRED_GEMINI = "pred_gemini"
 STAGE_PRED_GEMINI_SC2 = "pred_gemini_sc2"
 STAGE_PRED_GEMINI_SC3 = "pred_gemini_sc3"
 STAGE_HAND_CHECK = "hand_check"
-STAGE_JEB = "validator_jeb"
+STAGE_JEV = "validator_jev"
 STAGE_SUMMARY_JUDGE = "summary_judge"
 STAGE_CLEANLAB = "validator_cleanlab"
 STAGE_VALIDATORS = "validator_results"
@@ -123,9 +125,11 @@ def _with_narrative(gemini: pd.DataFrame, test_df: pd.DataFrame) -> pd.DataFrame
     return gemini.merge(test_df[["complaint_id", "narrative"]], on="complaint_id")
 
 
-def run_jeb(cfg, gemini, test_df, client, ledger, cache, limiter=None) -> pd.DataFrame:
-    """JEB validator rows for every Gemini prediction (Gemini-calling step)."""
-    return judge_classifications(
+def run_jev(
+    cfg, gemini, test_df, client: JevClient, ledger, cache, limiter=None
+) -> pd.DataFrame:
+    """Jev answers (noul per level) for every Gemini prediction (paid, Jev-calling step)."""
+    return _run_jev(
         _with_narrative(gemini, test_df), cfg, client, ledger, cache, limiter=limiter
     )
 
@@ -170,7 +174,7 @@ def build_validator_results(
     sc_runs: Sequence[pd.DataFrame],
     probs: dict[str, pd.DataFrame],
     cleanlab_rows: pd.DataFrame,
-    jeb: pd.DataFrame,
+    jev: pd.DataFrame,
 ) -> pd.DataFrame:
     """Combine every validator into one validator_results frame (no API calls here).
 
@@ -187,7 +191,7 @@ def build_validator_results(
         ),
         v_hierarchy(gemini, taxonomy),
         cleanlab_rows,
-        jeb,
+        v_jev(jev),
     ]
     return pd.concat(parts, ignore_index=True)[VALIDATOR_RESULTS_COLS]
 

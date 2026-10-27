@@ -16,10 +16,10 @@ def _nb(path: Path, *sources: str) -> Path:
 
 
 def test_refs_attribute_and_from_import():
-    src = "!pip x\n%load_ext y\nfrom nlp.store import stage, nope_x\nimport nlp.pipeline as P\nP.STAGE_JEB\nnlp.budget.Ledger"
+    src = "!pip x\n%load_ext y\nfrom nlp.store import stage, nope_x\nimport nlp.pipeline as P\nP.STAGE_JEV\nnlp.budget.Ledger"
     refs = refs_in_source(src)
     assert ("nlp.store", "stage") in refs and ("nlp.store", "nope_x") in refs
-    assert ("nlp.pipeline", "STAGE_JEB") in refs and ("nlp.budget", "Ledger") in refs
+    assert ("nlp.pipeline", "STAGE_JEV") in refs and ("nlp.budget", "Ledger") in refs
 
 
 def test_check_flags_missing(tmp_path):
@@ -57,7 +57,7 @@ def test_aliases_are_shared_across_cells(tmp_path):
     _nb(
         tmp_path / "a.ipynb",
         "from nlp import colab, pipeline as P\n",
-        "colab.setup\nP.STAGE_JEB\n",
+        "colab.setup\nP.STAGE_JEV\n",
         "colab.no_such_helper\nP.NO_SUCH_STAGE\n",
     )
     problems = check_notebooks(tmp_path)

@@ -30,6 +30,7 @@ class Config:
     thinking: str = "low"
     embed_model: str = "BAAI/bge-base-en-v1.5"
     likely_correct_threshold: float = 0.6
+    jev_model: str = "jev-1.14.0"
 
     @classmethod
     def load(cls, path: Path) -> Config:

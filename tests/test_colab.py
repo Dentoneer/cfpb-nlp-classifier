@@ -127,12 +127,12 @@ def test_results_markdown_mentions_everything():
         "classifier_board": pd.DataFrame(
             {"classifier": ["gemini"], "level": ["product"], "metric": ["accuracy"], "value": [0.9]}
         ),
-        "validator_board": pd.DataFrame({"validator": ["jeb"], "level": ["path"], "auroc": [0.8]}),
+        "validator_board": pd.DataFrame({"validator": ["jev"], "level": ["path"], "auroc": [0.8]}),
         "adjusted": pd.DataFrame({"level": ["product"], "value": [0.91]}),
         "decision": {"go": False, "reasons": ["because reasons"]},
     }
     md = colab.results_markdown(scored, 1.2345, 4.0)
-    for needle in ("NO-GO", "because reasons", "0.91", "jeb", "gemini", "$1.23"):
+    for needle in ("NO-GO", "because reasons", "0.91", "jev", "gemini", "$1.23"):
         assert needle in md
     scored["decision"] = {"go": True, "reasons": ["fine"]}
     assert "GO" in colab.results_markdown(scored, 0.0, 4.0)
@@ -219,10 +219,10 @@ def test_phase_estimate_marks_done_stages(tmp_path, capsys):
     ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
     rows = _tax_rows()
     tax = build_taxonomy(rows)
-    store.write(cfg, P.STAGE_JEB, pd.DataFrame({"x": [1]}))
+    store.write(cfg, P.STAGE_JEV, pd.DataFrame({"x": [1]}))
     est = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2))
-    assert est.set_index("stage").loc[P.STAGE_JEB, "done"]
-    assert colab.pending_usd(est, [P.STAGE_JEB]) == 0.0
+    assert est.set_index("stage").loc[P.STAGE_JEV, "done"]
+    assert colab.pending_usd(est, [P.STAGE_JEV]) == 0.0
     assert colab.pending_usd(est, [P.STAGE_PRED_GEMINI]) > 0
     assert "Still to spend" in capsys.readouterr().out
 
@@ -373,3 +373,23 @@ def test_restart_detection_logic():
     colab.check_code_fresh("abc", "abc")
     with pytest.raises(RuntimeError, match="Restart session"):
         colab.check_code_fresh("abc", "def")
+
+
+def test_phase_estimate_prices_jev_step_per_request(tmp_path, capsys):
+    from nlp import pipeline as P
+
+    cfg = _cfg(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
+    rows = _tax_rows()
+    tax = build_taxonomy(rows)
+    est = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2)).set_index("stage")
+    assert est.loc[P.STAGE_JEV, "step"] == "Jev validator, full test"
+    assert 0 < est.loc[P.STAGE_JEV, "bound_usd"] < 0.01  # $0.042 per 1M input tokens
+    ledger.record(cfg.jev_model, "a", 1000, 0)
+    after = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2)).set_index("stage")
+    assert after.loc[P.STAGE_JEV, "measured"]
+    # measured: one request per complaint, x1.5 safety
+    assert after.loc[P.STAGE_JEV, "usd"] == pytest.approx(
+        min(len(rows) * (1000 * 0.042 / 1e6) * colab.MEASURED_SAFETY, after.loc[P.STAGE_JEV, "bound_usd"])
+    )
+    capsys.readouterr()

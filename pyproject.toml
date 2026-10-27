@@ -15,6 +15,7 @@ dependencies = [
     "google-genai",
     "scipy",
     "duckdb",
+    "httpx",
 ]
 
 [project.optional-dependencies]
