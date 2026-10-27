@@ -13,7 +13,10 @@ _Last updated: 2026-10-27_
   `docs/superpowers/specs/2026-10-27-descriptions-v2-design.md`): drop no-sub-issue categories,
   Gemini outputs one `Product|Issue|Sub-issue` label, auto-written per-category descriptions
   (Marco: descriptions only, no examples yet), auto-archive of v1 Drive results (ledger kept),
-  and fixes for every first-run failure. Implementer subagent running; then review, PR, Marco reruns 00->05.
+  and fixes for every first-run failure. Implemented (commits 8b5d193..fa4bfb2, 292 tests, verified
+  on Python 3.13 + google-genai 2.12.1). **Spend cap raised to $5.00 (Marco, 2026-10-27).** Independent
+  review in progress; then PR, Marco merges, reruns 00->05. CI now: `test` matrix (3.11, 3.13) +
+  `lint-and-test` gate job (name required by ruleset) — confirm on first PR run.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
   `lint-and-test` check; repo admin (Marco) bypasses. Secret scanning + push protection on.
@@ -51,7 +54,7 @@ _Last updated: 2026-10-27_
 - Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Finish v2: review -> PR -> Marco merges -> rerun 00->05 (budget tight: ~$2.4-2.7 needed, ~$2.79 left; open question whether Marco raises the cap to $5).
+- Finish v2: review -> PR -> Marco merges -> rerun 00->05 (~$2.4-2.7 needed, ~$3.79 left under the $5 cap). Marco to raise the Google budget alert to ~$6.
 - Known, accepted limits: a timeout after Gemini already billed may under-count the ledger by
   ≤1 request; a 429 that persists through 5 retries surfaces as a raw `RateLimited` error;
   peak memory of notebook 01 on the full mirror is unmeasured (DuckDB spills to
