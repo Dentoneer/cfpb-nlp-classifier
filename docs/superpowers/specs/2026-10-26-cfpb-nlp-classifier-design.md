@@ -279,3 +279,16 @@ Exact time window; exact sentence-transformer model; batch size (compare 1 vs ~1
 on the tuning set if quota allows — batching can cost accuracy); ModernBERT hyperparameters and
 train size; whether non-LLM classifiers predict the full path as one label or per level (output
 must be a valid path); rare-category handling; JEB model choice within the free tier.
+
+## Update 2026-10-26 — JEB is Jev (approved by Marco)
+
+"JEB" in Marco's request meant **Jev**, TypeSafe AI's discriminative (non-generative) model that
+answers typed questions with calibrated probabilities. It replaces the Gemini yes/no judge as the
+binary validator. Gemini remains the classifier and the summary judge.
+- API: `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <TYPESAFE_API_KEY>`,
+  body `{model, state, questions:{id:{type:"noul", instructions}}}`; response `nouls[id].noul`
+  (P(yes)) and `usage.input_tokens/output_tokens`. Model `jev-1.14.0`. Price $0.042 / 1M input
+  tokens, output free. One request per complaint (state = narrative), three noul questions
+  (Product / Issue / Sub-issue fit). Spend recorded in the same ledger under the same $4 cap.
+- Validator name `jev`; per-level score = P(yes); path score = product of the three.
+- Key stored in Colab Secrets as `TYPESAFE_API_KEY`.

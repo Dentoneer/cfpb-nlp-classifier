@@ -162,7 +162,7 @@ The official CFPB files no longer carry narratives (removed 2026-08-14). Source 
   - `path_id(product, issue, sub_issue) -> str` joined by `" || "`.
   - `normalize_path(taxonomy, product, issue, sub_issue) -> tuple[str, str, str] | None` — exact match after casefold + whitespace collapse + straight quotes; `None` if no unique match.
   - `taxonomy_prompt_text(taxonomy) -> str` — compact nested listing (Product → Issue → Sub-issues) for the prompt.
-  - `choose_window(counts_by_month, months: int = 12) -> tuple[date, date]` — latest `months`-long window ending at the last full month in which the set of `(product, issue)` pairs is identical month to month for ≥ 90% of volume (algorithm: walk back from latest month, stop at first month whose pair set differs on >10% of volume).
+  - `choose_window(counts_by_month, data_end: date, months: int = 12) -> tuple[date, date]` (partial final month dropped; ruling) — latest `months`-long window ending at the last full month in which the set of `(product, issue)` pairs is identical month to month for ≥ 90% of volume (algorithm: walk back from latest month, stop at first month whose pair set differs on >10% of volume).
   - `stratified_sample(complaints, n, by: str, seed, min_per_class: int) -> pd.DataFrame` — proportional by `by`, each class gets `min(min_per_class, available)` first.
   - `make_splits(complaints, cfg) -> pd.DataFrame` (`splits` schema): draw tuning (stratified by product, `min_per_class=3`), test (stratified by product, `min_per_class=10`), train from the remainder (stratified by `path_id`, cap `train_max`); `self_consistency` = seeded stratified subset of test. `hand_check` set to False here — chosen later in Task 10 after Gemini runs.
 
@@ -346,7 +346,7 @@ The official CFPB files no longer carry narratives (removed 2026-08-14). Source 
 
 Each notebook starts with the same setup cell (from `00_setup`): mount Drive at `/content/drive`, `artifacts_dir = /content/drive/MyDrive/cfpb-nlp-classifier/phase1`, `git clone`/`git pull` the public repo, `pip install -e ".[ml,colab]"`, read `GEMINI_API_KEY` from `google.colab.userdata`, `google.colab.auth.authenticate_user()` + gspread client. Cells only call `nlp.*` functions wrapped in `store.stage`.
 
-- `01`: `product_counts_by_month(HF_SOURCE)` → `choose_window` (print; if it starts later than 2024-01-01 use it as `FilterParams.start`) → `load_clean` (stage `complaints_clean` + `filter_report`, print the report) → `build_taxonomy` → `publish_taxonomy` (print URL) → `make_splits` → print split sizes and Product distribution.
+- `01`: `product_counts_by_month(HF_SOURCE)` → `choose_window(counts, data_end=max date_received)` (print; if it starts later than 2024-01-01 use it as `FilterParams.start`) → `load_clean` (stage `complaints_clean` + `filter_report`, print the report) → `build_taxonomy` → `publish_taxonomy` (print URL) → `make_splits` → print split sizes and Product distribution.
 - `02` (GPU runtime): TF-IDF, EmbedLR, EmbedKNN, ModernBERT fit_or_load → predictions on tuning + test → TF-IDF 5-fold OOF probs for cleanlab.
 - `03`: **model bake-off** — 50 tuning rows × candidates `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` (print accuracy per level and actual $ each; total ≤ ~$0.30); Marco picks → set `classifier_model` in config (commit). **Batch size check** on tuning: 10 vs 25 per request. **Thinking level check**: lowest level that holds tuning accuracy (thinking is billed as output). **Prompt iterations** on tuning (bump `prompt_version` each). Print `estimate_run` for the test set + JEB + self-consistency and the remaining cap **before** the paid test run; then classify test.
 - `04`: JEB on full test, summary judge on 100 test rows, self-consistency (2 extra runs on the 150 subset), non-LLM validators, `select_hand_check` → `write_review_sheet` (print URL). **Stop: Marco reviews.**
@@ -372,3 +372,23 @@ Each notebook starts with the same setup cell (from `00_setup`): mount Drive at 
 ## What happens after the build (Marco, in Colab)
 
 Runs 01 → 04 (~1–2 hours plus model bake-off decision), reviews ~200 rows in the Sheet (~2 hours), runs 05. Results feed the Phase 2 design.
+
+---
+
+### Task 15: Jev replaces the Gemini JEB judge (added 2026-10-26, Marco-approved)
+
+**Files:**
+- Create: `nlp/llm/jev.py`, `tests/test_jev.py`
+- Modify: `config/phase1.yaml` + `nlp/config.py` (`jev_model: "jev-1.14.0"`, price `jev-1.14.0: [0.042, 0.0]`), `nlp/pipeline.py` (`run_jev` replaces `run_jeb`), `nlp/llm/judge.py` (remove JEB classification judge; keep summary judge), `nlp/validators.py`/`nlp/ensemble.py` if they name `jeb`, `nlp/smoke.py` (fake Jev client), `nlp/colab.py` (read `TYPESAFE_API_KEY` secret; estimates include Jev), notebooks 04 (and any JEB references), `notebooks/README.md`.
+
+**Interfaces:**
+- `JevResponse(nouls: dict[str, float], input_tokens: int | None, output_tokens: int | None, model: str)`.
+- `JevClient` protocol: `system_one(model: str, state: str, questions: dict[str, dict]) -> JevResponse`; raises `RateLimited(retry_after, daily=False)` on 429.
+- `HttpJevClient(api_key, base_url="https://api.typesafe.ai", timeout=60)` — httpx POST `/v1/systemone`, JSON `{model, state, questions}`; maps 429 (honour `retry-after`), other 4xx/5xx → exception with body text. `FakeJevClient(responder)`.
+- `JEV_PROMPT_VERSION = "jev-v1"`; `build_jev_questions(product, issue, sub_issue) -> dict` (ids `product_ok`, `issue_ok`, `sub_issue_ok`; each `{"type": "noul", "instructions": <testable claim, e.g. "This complaint is about the financial product: '<product>'.">}`; sub_issue "(none)" → claim that no more specific sub-issue applies).
+- `run_jev(rows, cfg, client, ledger, cache, *, limiter=None, sleep=...) -> pd.DataFrame` — rows have complaint_id, narrative (clean_text with cfg.max_chars), Gemini product/issue/sub_issue. Sequential: reserve(est_in=len(state+questions json)/4, est_out=0) → limiter.wait → system_one → ledger.record(model, rid, input_tokens or estimate, 0) → cache.put. Cache key `{cid}|jev|{model}|{JEV_PROMPT_VERSION}`; records store judged labels; mismatch = miss. Budget/daily-quota/backoff semantics identical to run_queue.
+- `v_jev(jev_results) -> validator_results` — validator `jev`; levels product/issue/sub_issue score = noul, verdict = score ≥ 0.5; path score = product of the three, verdict = path score ≥ 0.5.
+
+- [ ] Failing tests (FakeJevClient): request shape (three noul questions with labels in instructions), cache hit = zero calls and zero spend, label change → re-judged, spend recorded before cache.put, budget stop clean, 429 backoff honours retry-after, v_jev scores/verdicts incl. path product; `slow` live test with `TYPESAFE_API_KEY`.
+- [ ] Implement; smoke + check_notebooks + full suite green.
+- [ ] Commit `feat: jev judge replaces gemini jeb`.
