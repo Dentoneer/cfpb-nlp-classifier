@@ -21,7 +21,7 @@ from nlp.budget import BudgetExceeded, DailyQuotaExhausted, Ledger, RateLimiter,
 from nlp.config import Config
 from nlp.data import clean_text, load_clean
 from nlp.errors import StageIncomplete
-from nlp.llm.classify import build_prompt, estimate_request_tokens
+from nlp.llm.classify import build_prompt, estimate_request_tokens, run_classification
 from nlp.llm.client import GeminiClient, RequestRejected, ServiceUnavailable
 from nlp.llm.describe import (
     STAGE_DESCRIPTIONS,
@@ -108,7 +108,7 @@ def apply_choices(cfg: Config, require_pick: bool = False, **choices) -> Config:
         and choices.get("classifier_model") is None
         and "classifier_model" not in read_overrides(cfg.artifacts_dir)
     ):
-        raise ValueError("Set PICK to your chosen model (e.g. 'gemini-2.5-flash') and rerun.")
+        raise ValueError("Set PICK to your chosen model (e.g. 'gemini-3.8-flash') and rerun.")
     changes = {k: v for k, v in choices.items() if v is not None and v != getattr(cfg, k, None)}
     if changes:
         cfg = save_overrides(cfg, **changes)
@@ -143,17 +143,30 @@ def check_code_fresh(head_at_import: str | None, head_now: str | None) -> None:
         raise RuntimeError(RESTART_MSG)
 
 
+def _secret(userdata, name: str) -> str | None:
+    """The secret's value with surrounding spaces/newlines removed (None if blank)."""
+    value = userdata.get(name)
+    value = "" if value is None else str(value).strip()
+    return value or None
+
+
 def read_secrets(userdata) -> tuple[str, str | None]:
-    """(Gemini key, Jev key or None). Gemini's secret is required; the Jev one is optional."""
+    """(Gemini key, Jev key or None). Gemini's secret is required; the Jev one is optional.
+
+    Both are stripped: a space or line break pasted along with a key makes Google reject it.
+    """
+    missing = (
+        "GEMINI_API_KEY not found. In Colab open the key icon (Secrets) on the left, add "
+        "GEMINI_API_KEY and switch 'Notebook access' on."
+    )
     try:
-        api_key = userdata.get("GEMINI_API_KEY")
+        api_key = _secret(userdata, "GEMINI_API_KEY")
     except Exception as e:  # secret missing or notebook access not granted
-        raise RuntimeError(
-            "GEMINI_API_KEY not found. In Colab open the key icon (Secrets) on the left, add "
-            "GEMINI_API_KEY and switch 'Notebook access' on."
-        ) from e
+        raise RuntimeError(missing) from e
+    if api_key is None:
+        raise RuntimeError(missing + " (The secret is there but its value is empty.)")
     try:
-        jev_key = userdata.get("TYPESAFE_API_KEY") or None
+        jev_key = _secret(userdata, "TYPESAFE_API_KEY")
     except Exception:  # noqa: BLE001 - Colab raises various errors for a missing secret
         jev_key = None
     if jev_key is None:
@@ -164,11 +177,105 @@ def read_secrets(userdata) -> tuple[str, str | None]:
     return api_key, jev_key
 
 
+def _genai_client(api_key: str):
+    from google import genai
+
+    return genai.Client(api_key=api_key)
+
+
+def _key_facts(api_key: str) -> str:
+    """Length, first 3 characters and whether it has stray spaces - never the key itself."""
+    raw = api_key or ""
+    ws = "yes" if raw != raw.strip() or any(c.isspace() for c in raw) else "no"
+    return f"length {len(raw.strip())}, starts with '{raw.strip()[:3]}', whitespace: {ws}"
+
+
+def check_gemini_key(api_key: str, make_client: Callable | None = None) -> bool:
+    """Free check that Google accepts the Gemini key (lists models; nothing is generated).
+
+    Prints the result. On failure prints what to do (README 'Key problems') and returns False.
+    """
+    key = (api_key or "").strip()
+    note = (
+        " (Keys starting 'AQ.' are the new AI Studio format - that is normal.)"
+        if key.startswith("AQ.")
+        else ""
+    )
+    try:
+        client = (make_client or _genai_client)(key)
+        n = sum(1 for _ in client.models.list())
+    except Exception as e:  # noqa: BLE001 - any failure here means the key does not work
+        from nlp.llm.client import explain_rejection
+
+        why = explain_rejection(e) if hasattr(e, "code") else f"{type(e).__name__}: {e}"
+        print(
+            f"PROBLEM: the Gemini key check failed: {why}\n"
+            "What to do: open README.md, section 'What to do if a notebook stops' -> 'Key "
+            "problems'. In short: in Colab Secrets (key icon) delete GEMINI_API_KEY, paste the "
+            "key again from aistudio.google.com/apikey (no spaces), switch Notebook access on, "
+            "then Runtime -> Restart session and rerun from the top."
+        )
+        return False
+    print(f"Gemini key works ({n} models visible; {_key_facts(api_key)}).{note}")
+    return True
+
+
+DATA_VERSION_FILE = "data_version.txt"
+# Results that belong to one data version. Never moved: ledger.jsonl (the spend cap must keep
+# counting old spend), the Gemini / judge caches and config_overrides.json.
+ARCHIVE_NAMES = ("models", "taxonomy_url.txt", "review_sheet_url.txt", "results.md")
+
+
+def _free_name(dest: Path) -> Path:
+    """`dest`, or `dest` with a numeric suffix if something already has that name."""
+    if not dest.exists():
+        return dest
+    k = 2
+    while (cand := dest.with_name(f"{dest.stem}_{k}{dest.suffix}")).exists():
+        k += 1
+    return cand
+
+
+def archive_old_results(artifacts_dir: Path, data_version: str) -> list[str]:
+    """Move results made with another data version into `archive_<old version>/`.
+
+    Compares `data_version` with `data_version.txt` in the artifacts dir (missing = "v1").
+    When they differ, moves every *.parquet plus models/, the Sheet URL files and results.md,
+    then writes the new marker and prints what moved. Idempotent: once the marker matches,
+    nothing is touched, so new results are never archived. Returns the moved names.
+    """
+    import shutil
+
+    art = Path(artifacts_dir)
+    art.mkdir(parents=True, exist_ok=True)
+    marker = art / DATA_VERSION_FILE
+    old = marker.read_text(encoding="utf-8").strip() if marker.exists() else "v1"
+    if marker.exists() and old == data_version:
+        return []
+    items = sorted(art.glob("*.parquet")) + [art / n for n in ARCHIVE_NAMES if (art / n).exists()]
+    moved: list[str] = []
+    if items and old != data_version:
+        dest_dir = art / f"archive_{old}"
+        dest_dir.mkdir(exist_ok=True)
+        for p in items:
+            shutil.move(str(p), str(_free_name(dest_dir / p.name)))
+            moved.append(p.name)
+        print(
+            f"Data version changed ({old} -> {data_version}): moved {len(moved)} old result(s) "
+            f"into {dest_dir.name}/: {', '.join(moved)}. Kept in place: ledger (spend so far), "
+            "saved Gemini answers and your saved choices. Nothing to do - just carry on."
+        )
+    marker.write_text(data_version + "\n", encoding="utf-8")
+    return moved
+
+
 def setup(
     repo_dir: str = "/content/cfpb-nlp-classifier",
     drive_subdir: str = "cfpb-nlp-classifier/phase1",
+    drive_root: str = "/content/drive",
 ):
-    """Mount Drive, load config, fetch the Gemini and Jev keys, authorise Sheets.
+    """Mount Drive, archive results of an older data version, load config, fetch the Gemini
+    and Jev keys, authorise Sheets.
 
     Returns (cfg, gc, api_key, jev_key); jev_key is None if the optional TYPESAFE_API_KEY
     secret is not set (only notebook 04's Jev step needs it).
@@ -176,9 +283,10 @@ def setup(
     check_code_fresh(_HEAD_AT_IMPORT, _git_head(Path(repo_dir)))
     from google.colab import auth, drive, userdata
 
-    drive.mount("/content/drive")
-    artifacts = Path("/content/drive/MyDrive") / drive_subdir
+    drive.mount(drive_root)
+    artifacts = Path(drive_root) / "MyDrive" / drive_subdir
     cfg = load_config(Path(repo_dir) / "config" / "phase1.yaml", artifacts)
+    archive_old_results(artifacts, cfg.data_version)
     api_key, jev_key = read_secrets(userdata)
     auth.authenticate_user()
     import google.auth
@@ -498,12 +606,24 @@ def run_classic(cfg: Config, name: str, make, train_df: pd.DataFrame, eval_df: p
 def compare_runs(
     runs: dict[str, Callable[[], pd.DataFrame]], truth: pd.DataFrame, ledger: Ledger
 ) -> pd.DataFrame:
-    """Run each paid classification, report accuracy per level and the real $ (ledger delta)."""
+    """Run each paid classification, report accuracy per level and the real $ (ledger delta).
+
+    A run Google refuses (retired model, unsupported thinking level, ...) costs nothing: it is
+    printed as "<run> skipped: <reason>", shown as skipped in the table, and the rest go on.
+    """
     rows = []
     for name, fn in runs.items():
         before = ledger.spent()
         try:
             pred = fn()
+        except RequestRejected as e:
+            print(f"{name} skipped: {e.message}")
+            rows.append(
+                {"run": name, "status": f"skipped: {e.message}", "rows_done": 0,
+                 "of": len(truth), **dict.fromkeys(LEVELS4, math.nan),
+                 "usd": ledger.spent() - before}
+            )  # fmt: skip
+            continue
         except DailyQuotaExhausted as e:
             raise StageIncomplete(
                 f"The daily Gemini request quota is used up during '{name}' "
@@ -520,10 +640,123 @@ def compare_runs(
             ) from None
         acc = accuracy_by_level(pred, truth)
         rows.append(
-            {"run": name, "rows_done": len(pred), "of": len(truth), **acc,
+            {"run": name, "status": "ok", "rows_done": len(pred), "of": len(truth), **acc,
              "usd": ledger.spent() - before}
         )  # fmt: skip
     return pd.DataFrame(rows)
+
+
+def cached_predictions(
+    cache: JsonlCache, ids: Iterable[str], model: str, prompt_version: str
+) -> tuple[str | None, pd.DataFrame]:
+    """(run name, predictions) of the saved run for `model` and `prompt_version` that covers
+    the most of `ids` (complaint_id, product, issue, sub_issue); (None, empty) if none."""
+    want = {str(i) for i in ids}
+    by_run: dict[str, list[dict]] = {}
+    for key in sorted(cache.keys()):
+        parts = key.split("|")
+        if len(parts) != 4 or parts[2] != model or parts[3] != prompt_version or parts[0] not in want:
+            continue
+        v = cache.get(key) or {}
+        if all(k in v for k in ("product", "issue", "sub_issue")):
+            by_run.setdefault(parts[1], []).append({"complaint_id": parts[0], **v})
+    if not by_run:
+        return None, pd.DataFrame(columns=["complaint_id", "product", "issue", "sub_issue"])
+    run = max(sorted(by_run), key=lambda r: len(by_run[r]))
+    return run, pd.DataFrame(by_run[run])
+
+
+def prompt_check(
+    cfg: Config,
+    tuning_df: pd.DataFrame,
+    client: GeminiClient,
+    ledger: Ledger,
+    cache: JsonlCache,
+    taxonomy: pd.DataFrame,
+    limiter: RateLimiter | None = None,
+    old_version: str = "v1",
+) -> pd.DataFrame:
+    """Part C: the current prompt on all tuning complaints, compared (on the complaints both
+    saw) with answers the old prompt gave on the first run, if any are saved. Free to rerun."""
+    name = f"tuning_{cfg.prompt_version}"
+    check_fits(ledger, estimate_classification(cfg, tuning_df, taxonomy), "Tuning check")
+    got: dict[str, pd.DataFrame] = {}
+
+    def run() -> pd.DataFrame:
+        got["pred"] = run_classification(tuning_df, cfg, client, ledger, cache, name,
+                                         taxonomy=taxonomy, limiter=limiter)  # fmt: skip
+        return got["pred"]
+
+    label = f"new prompt ({cfg.prompt_version})"
+    table = compare_runs({f"{label}, all {len(tuning_df)}": run}, tuning_df, ledger)
+    old_run, old = cached_predictions(cache, tuning_df["complaint_id"], cfg.classifier_model,
+                                      old_version)  # fmt: skip
+    new = got.get("pred")
+    if old_run is None or new is None:
+        print(f"No answers from the old prompt ({old_version}) are saved for these complaints "
+              f"with {cfg.classifier_model}; nothing to compare.")  # fmt: skip
+    else:
+        same = sorted(set(old["complaint_id"]) & set(new["complaint_id"].astype(str)))
+        n = len(same)
+        extra = [
+            {"run": f"old prompt ({old_version}), same {n}", "status": f"saved run {old_run}",
+             "rows_done": n, "of": n, **accuracy_by_level(old[old["complaint_id"].isin(same)],
+             tuning_df), "usd": 0.0},
+            {"run": f"{label}, same {n}", "status": "ok", "rows_done": n, "of": n,
+             **accuracy_by_level(new[new["complaint_id"].astype(str).isin(same)], tuning_df),
+             "usd": 0.0},
+        ]  # fmt: skip
+        table = pd.concat([table, pd.DataFrame(extra)], ignore_index=True)
+        print(f"Compared with the old prompt on the {n} complaints both answered "
+              f"(saved run '{old_run}').")  # fmt: skip
+    print(table.round(3).to_string(index=False))
+    return table
+
+
+def diagnose(
+    cfg: Config,
+    api_key: str,
+    ledger: Ledger,
+    candidates: Iterable[str] | None = None,
+    make_client: Callable | None = None,
+) -> None:
+    """Free troubleshooting printout (no generate calls): settings, library, key, spend, saves."""
+    try:
+        from importlib.metadata import version
+
+        genai_version = version("google-genai")
+    except Exception:  # noqa: BLE001 - not installed / unknown
+        genai_version = "not installed"
+    print("== Troubleshooting (free: nothing is sent to Gemini except a model list) ==")
+    print(f"Candidates in memory: {list(candidates) if candidates else '(not set in this session)'}")
+    print(
+        f"Classifier {cfg.classifier_model} | judge {cfg.judge_model} | describe "
+        f"{cfg.describe_model} | thinking {cfg.thinking} | batch {cfg.batch_size} | prompt "
+        f"{cfg.prompt_version}"
+    )
+    print(f"google-genai library version: {genai_version}")
+    print(f"Gemini key: {_key_facts(api_key)}")
+    check_gemini_key(api_key, make_client=make_client)
+    print(ledger_report(ledger))
+    per_model: dict[str, int] = {}
+    if ledger.path.exists():
+        for line in ledger.path.read_text(encoding="utf-8").splitlines():
+            try:
+                m = json.loads(line)["model"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            per_model[m] = per_model.get(m, 0) + 1
+    for m, n in sorted(per_model.items()):
+        print(f"  {m}: {n} paid request(s)")
+    cache = JsonlCache(Path(cfg.artifacts_dir) / "gemini_cache.jsonl")
+    per_run: dict[str, int] = {}
+    for key in sorted(cache.keys()):
+        parts = key.split("|")
+        run = " | ".join(parts[1:]) if len(parts) >= 4 else key
+        per_run[run] = per_run.get(run, 0) + 1
+    print(f"Saved Gemini answers: {sum(per_run.values())}")
+    for run, n in sorted(per_run.items()):
+        print(f"  {run}: {n}")
 
 
 def phase_estimate(

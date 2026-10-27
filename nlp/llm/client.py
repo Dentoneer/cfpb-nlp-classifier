@@ -72,6 +72,29 @@ class FakeClient:
         return self.responder(model, system, user, response_schema, thinking)
 
 
+KEY_HELP = "Gemini rejected the API key. See README 'Key problems'."
+
+
+def explain_rejection(e, model: str | None = None, thinking: str | None = None) -> str:
+    """Plain-English reason (and what to do) for a google-genai ClientError other than 429."""
+    code = getattr(e, "code", None)
+    message = str(getattr(e, "message", None) or e)
+    text = f"{message} {getattr(e, 'status', '')} {getattr(e, 'details', '')}".lower()
+    if code == 404 or "no longer available" in text:
+        return (
+            f"Gemini model '{model}' is retired or unknown (Google says: {message[:160]}): model "
+            "retired, remove it from the list."
+        )
+    if "api key" in text or "api_key" in text or code in (401, 403):
+        return KEY_HELP
+    if code == 400 and "thinking" in text:
+        return (
+            f"Model '{model}' does not accept thinking level '{thinking}': this model does not "
+            "support that thinking level. Remove that level from the list (or pick another)."
+        )
+    return f"Google refused the request (HTTP {code}): {message[:300]}"
+
+
 _BUDGETS = {"none": 0, "minimal": 0, "low": 512, "medium": 2048, "high": 8192}
 _LEVELS = {
     "none": "MINIMAL",
@@ -123,7 +146,7 @@ class GenAIClient:
         except errors.ClientError as e:
             if e.code == 429:
                 raise self._rate_limited(e) from e
-            raise
+            raise RequestRejected(e.code, explain_rejection(e, model, thinking)) from e
         except errors.ServerError as e:  # 5xx, e.g. 503 "model is overloaded": not billed
             raise ServiceUnavailable(f"Gemini HTTP {e.code}: {e.message}") from e
         except httpx.TimeoutException as e:

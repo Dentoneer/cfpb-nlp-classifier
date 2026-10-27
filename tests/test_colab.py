@@ -679,3 +679,64 @@ def test_publish_descriptions_then_load_edits(tmp_path, capsys):
     ws.values[2][-1] = ""
     with pytest.raises(colab.StageIncomplete, match="empty"):
         colab.load_description_edits(cfg, gc, tax)
+
+
+def test_prompt_check_compares_with_old_cached_answers(tmp_path, capsys):
+    import re
+
+    from nlp import pipeline as P
+    from nlp.budget import RateLimiter
+    from nlp.llm.client import FakeClient, LLMResponse
+
+    cfg = _cfg(tmp_path)
+    rows, _, tax = _describe_inputs()
+    store.write(cfg, P.STAGE_DESCRIPTIONS, _desc_stage(tax))
+    truth = rows
+    cache = store.JsonlCache(tmp_path / "gemini_cache.jsonl")
+    model = cfg.classifier_model
+    # Old (v1) answers saved by the first run for 3 of the 8 complaints: 1 right, 2 wrong.
+    for cid, sub in (("c0", "S1"), ("c1", "S2"), ("c2", "S1")):
+        r = truth.set_index("complaint_id").loc[cid]
+        cache.put(f"{cid}|bakeoff_{model}|{model}|v1",
+                  {"complaint_id": cid, "product": r["product"], "issue": r["issue"],
+                   "sub_issue": sub})  # fmt: skip
+
+    def right(m, system, user, schema, thinking):
+        ids = re.findall(r"complaint_id: (\S+)", user)
+        t = truth.set_index("complaint_id")
+        return LLMResponse(json.dumps([
+            {"complaint_id": i, "label": f"{t.at[i, 'product']}|{t.at[i, 'issue']}|{t.at[i, 'sub_issue']}",
+             "summary": "s", "confidence": 0.9} for i in ids]), 100, 50)  # fmt: skip
+
+    ledger = Ledger(tmp_path / "ledger.jsonl", 5.0, cfg.prices)
+    out = colab.prompt_check(cfg, rows, FakeClient(right), ledger, cache, tax,
+                             RateLimiter(10_000, sleep=lambda s: None))  # fmt: skip
+    t = out.set_index("run")
+    assert t.loc["new prompt (v2), all 8", "path"] == 1.0
+    assert t.loc["old prompt (v1), same 3", "path"] == pytest.approx(1 / 3)
+    assert t.loc["new prompt (v2), same 3", "path"] == 1.0
+    assert "old prompt" in capsys.readouterr().out
+
+
+def test_prompt_check_without_old_answers_says_so(tmp_path, capsys):
+    from nlp import pipeline as P
+    from nlp.budget import RateLimiter
+
+    cfg = _cfg(tmp_path)
+    rows, _, tax = _describe_inputs()
+    store.write(cfg, P.STAGE_DESCRIPTIONS, _desc_stage(tax))
+    ledger = Ledger(tmp_path / "ledger.jsonl", 5.0, cfg.prices)
+    cache = store.JsonlCache(tmp_path / "gemini_cache.jsonl")
+    cache.put(f"c0|tuning_v2|{cfg.classifier_model}|x", {})  # other versions are not "old"
+    from nlp.llm.client import FakeClient
+
+    def rejected(*a):
+        from nlp.llm.client import RequestRejected
+
+        raise RequestRejected(404, "model retired, remove it from the list")
+
+    out = colab.prompt_check(cfg, rows, FakeClient(rejected), ledger, cache, tax,
+                             RateLimiter(10_000, sleep=lambda s: None))  # fmt: skip
+    printed = capsys.readouterr().out
+    assert "skipped" in printed and "No answers from the old prompt" in printed
+    assert len(out) == 1
