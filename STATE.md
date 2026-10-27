@@ -1,32 +1,52 @@
 # STATE
 
-_Last updated: 2026-10-26_
+_Last updated: 2026-10-27_
 
 ## Current status
-- Phase 1 design approved by Marco (2026-10-26).
-- Repo live and **public**: https://github.com/Dentoneer/cfpb-nlp-classifier (public because
-  rulesets need GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1
-  approval required, repo admin (Marco) bypasses. Secret scanning + push protection on.
-- CI live (`.github/workflows/ci.yml`, ruff + pytest) via PR #1; ruleset now also requires the
-  `lint-and-test` check. Sister (Karoltrojacek) invited with Write — pending acceptance.
-- Implementation plan written: `docs/superpowers/plans/2026-10-26-phase1-colab-nlp.md`
-  (14 tasks). Awaiting Marco's review + choice of execution method.
-- Verified Gemini prices 2026-10-26 (per 1M in/out): 3.8-flash 0.75/3.75, 2.5-flash 0.30/2.50,
-  3.5-flash-lite 0.30/2.50, 3.1-flash-lite 0.25/1.50. 3.8-flash likely too pricey for the $4 cap
-  on the full run → small bake-off decides.
-- No NLP code yet. Implementation plan is next.
+- **Phase 1 code complete** on branch `feat/phase1-nlp` (14 tasks + Jev task, 172+ tests passing).
+  One PR to `main` is pending the final whole-branch review. Notebooks clone `main`, so the PR
+  must be merged before Marco can run them.
+- Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
+  GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
+  `lint-and-test` check; repo admin (Marco) bypasses. Secret scanning + push protection on.
+  CI = ruff + pytest + notebook check. Sister (Karoltrojacek) invited with Write — acceptance
+  not confirmed.
+- Run guide for Marco and his sister is the "Run Phase 1" section in `README.md`;
+  `notebooks/README.md` has the notebook table. Expected cost ~$2-3 of the $4 cap.
+- Not yet run live: nothing has been executed in Colab against real keys.
 
 ## Recent decisions
-- Dataset: CFPB complaints; hierarchy Product → Issue → Sub-issue.
-- Classifiers: Gemini (main), TF-IDF+LR, sentence-transformers+LR, kNN, ModernBERT. BERTopic dropped.
-- Validators: CFPB label, second opinions, Gemini confidence, self-consistency, hierarchy rules,
-  JEB binary judge, cleanlab, ensemble (simple + learned).
-- Billing: dedicated GCP project `cfpb-nlp-classifier`, Tier 1, $5 budget, $4 code cap.
-  Free tier was 5 RPM / 20 RPD (Gemini 2.5 Flash) — too slow.
-- One repo; collaborator access for Marco's sister; PR approvals required.
+- **Data source (2026-10-26):** CFPB stopped publishing narratives on 2026-08-14. Using HF mirror
+  `Bob-68/cfpb-consumer-complaints` (3.8M rows with narrative, to 2026-07-06) via DuckDB with
+  Marco-approved noise filters (window 2024-01→2026-07, templates ≥5 copies dropped — one letter
+  appeared 30,102×, <200 chars / >30% XXXX dropped, sub-issue consistency rule, paths <30 rows
+  dropped). Expect ~0.9-1M clean rows.
+- **Classifiers:** Gemini (main), TF-IDF+LR, embeddings+LR, kNN, ModernBERT. BERTopic dropped.
+  Gemini model chosen by a bake-off in notebook 03 (saved to Drive `config_overrides.json`).
+  Prices verified 2026-10-26 (per 1M in/out): 3.8-flash 0.75/3.75, 2.5-flash 0.30/2.50,
+  3.5-flash-lite 0.30/2.50, 3.1-flash-lite 0.25/1.50.
+- **Validators:** CFPB label, second opinions, Gemini confidence, self-consistency, hierarchy
+  rules, Jev, cleanlab, simple + learned ensembles. **"JEB" = Jev** (TypeSafe AI's yes/no model):
+  replaced the Gemini judge as validator `jev` (3 questions per complaint, $0.042/1M input,
+  output free, same ledger/cap). Gemini remains only as the summary judge.
+- **Billing:** dedicated GCP project, Tier 1, $5 budget alert, **$4 hard cap in code** (Google
+  alerts do not stop spending). Free tier (5 RPM / 20 RPD) too slow.
+- **Operationalization (Phase 2):** Colab for Phase 1 experiments only. Production = same `nlp/`
+  package as a Docker image (CI builds it) on **Cloud Run Jobs**, Airflow to sequence (Docker
+  locally to start), BigQuery for storage, dbt for merge/tests. Vertex AI Pipelines and Cloud
+  Composer rejected as overkill; BigQuery in-SQL Gemini rejected (loses spend cap, cache,
+  validation); JupyterHub not needed.
+- Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Marco: create GCP project + API key + billing + $5 budget alert.
-- Verify Gemini model choice + prices at build time.
-- Add sister as collaborator (Write role): Marco to invite via Settings → Collaborators using her
-  email, or get her username.
+- Finish: final whole-branch review, then PR `feat/phase1-nlp` → `main`; Marco merges.
+- Add this project to sites-hub (controller/Marco).
+- **Marco before running:** create GCP project + Gemini API key + billing + $5 budget alert; get a
+  Jev key from console.typesafe.ai; add `GEMINI_API_KEY` and `TYPESAFE_API_KEY` to Colab Secrets
+  (Notebook access on).
+- **Then run notebooks 00 → 05** (02 needs a T4 GPU). Stop after 04 for ~2 hours of hand review of
+  the ~200-row Google Sheet, then run 05 for the leaderboards and go/no-go.
+- **Confirm Jev response JSON nesting** on the first live call (slow test `test_live_jev_call`,
+  or notebook 04's Jev step); adjust the parser if it differs.
+- Sister: confirm she accepted the collaborator invite.
+- After go/no-go: design Phase 2 (Docker image, Cloud Run Jobs, BigQuery, dbt, Airflow).

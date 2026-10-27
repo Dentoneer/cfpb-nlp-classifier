@@ -14,7 +14,7 @@ way; notebooks 00-03 run without it (setup just prints a note).
 | 01 | `01_data_and_splits.ipynb` - load, filter, taxonomy, splits | CPU | 5-15 min | $0 |
 | 02 | `02_baselines.ipynb` - TF-IDF, embeddings, kNN, ModernBERT | **GPU (T4)** | 45-90 min | $0 |
 | 03 | `03_gemini.ipynb` - bake-off, settings, 800-row test run | CPU | 30-90 min | ~$1.5-2.5 |
-| 04 | `04_validators.ipynb` - judges, validators, review sheet | CPU | 30-60 min | ~$1-2 |
+| 04 | `04_validators.ipynb` - judges, validators, review sheet | CPU | 30-60 min | ~$0.2-0.5 |
 | 05 | `05_results.ipynb` - ensembles, leaderboards, go/no-go | CPU | 5 min | $0 |
 
 Run them in order. After 04, **stop and fill in the review sheet** (link printed at the end of 04),
