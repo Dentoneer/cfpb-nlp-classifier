@@ -3,9 +3,13 @@
 _Last updated: 2026-10-27_
 
 ## Current status
-- **Phase 1 code complete** on branch `feat/phase1-nlp` (14 tasks + Jev task, 179 tests passing).
-  One PR to `main` is pending the final whole-branch review. Notebooks clone `main`, so the PR
-  must be merged before Marco can run them.
+- **Phase 1 code complete** on branch `feat/phase1-nlp` (14 tasks + Jev task, 216 tests passing).
+  Final whole-branch review done ("with fixes"); all 12 fixes committed in `fff1a90` (data load
+  filters inside DuckDB, cleanlab missing-row crash, explicit budget-stop exception, 5xx/timeout
+  retries, summary-judge section in results, Jev ids in nb 04, model fingerprint includes
+  training rows, config price validation). Scoped re-review clean (all 12 addressed). Next: one PR
+  to `main` (awaiting Marco's go-ahead to push).
+  Notebooks clone `main`, so the PR must be merged before Marco can run them.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
   `lint-and-test` check; repo admin (Marco) bypasses. Secret scanning + push protection on.
@@ -39,7 +43,11 @@ _Last updated: 2026-10-27_
 - Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Finish: final whole-branch review, then PR `feat/phase1-nlp` → `main`; Marco merges.
+- Finish: push `feat/phase1-nlp`, open PR → `main`; Marco merges.
+- Known, accepted limits: a timeout after Gemini already billed may under-count the ledger by
+  ≤1 request; a 429 that persists through 5 retries surfaces as a raw `RateLimited` error;
+  peak memory of notebook 01 on the full mirror is unmeasured (DuckDB spills to
+  `/content/duckdb_tmp`) — watch the first run.
 - Add this project to sites-hub (controller/Marco).
 - **Marco before running:** create GCP project + Gemini API key + billing + $5 budget alert; get a
   Jev key from console.typesafe.ai; add `GEMINI_API_KEY` and `TYPESAFE_API_KEY` to Colab Secrets
