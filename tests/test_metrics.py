@@ -17,11 +17,11 @@ def _frames():
     pred_p = ["A", "A", "B", "B", "C", "C"]
     ids = [f"c{i}" for i in range(6)]
     truth = pd.DataFrame(
-        {"complaint_id": ids, "product": truth_p, "issue": ["x"] * 6, "sub_issue": ["(none)"] * 6}
+        {"complaint_id": ids, "product": truth_p, "issue": ["x"] * 6, "sub_issue": ["s"] * 6}
     )
     pred = pd.DataFrame(
         {"complaint_id": ids[::-1], "product": pred_p[::-1], "issue": ["x"] * 6,
-         "sub_issue": ["(none)"] * 6}
+         "sub_issue": ["s"] * 6}
     )
     return pred, truth
 

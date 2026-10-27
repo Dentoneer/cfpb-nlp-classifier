@@ -14,7 +14,7 @@ def _frame(n=30000, seed=0):
     rng = np.random.default_rng(seed)
     prods = rng.choice(["A", "B", "C", "D"], size=n, p=[0.5, 0.3, 0.19, 0.01])
     issues = rng.choice(["i1", "i2", "i3"], size=n)
-    subs = rng.choice(["s1", "s2", "(none)"], size=n)
+    subs = rng.choice(["s1", "s2", "s3"], size=n)
     return pd.DataFrame(
         {
             "complaint_id": [f"c{i}" for i in range(n)],

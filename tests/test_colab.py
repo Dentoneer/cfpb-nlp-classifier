@@ -16,7 +16,7 @@ def test_load_config_overrides_artifacts_dir(tmp_path):
     cfg = colab.load_config(CONFIG, tmp_path / "phase1")
     assert cfg.artifacts_dir == tmp_path / "phase1"
     assert (tmp_path / "phase1").is_dir()
-    assert cfg.spend_cap_usd == 4.00
+    assert cfg.spend_cap_usd == 5.00
 
 
 def test_overrides_roundtrip_and_validation(tmp_path):

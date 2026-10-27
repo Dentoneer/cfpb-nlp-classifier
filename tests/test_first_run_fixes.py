@@ -326,3 +326,21 @@ def test_config_class_has_v2_keys():
     cfg = Config.load(CONFIG)
     assert cfg.describe_model == "gemini-3.8-flash"
     assert cfg.data_version == "v2" and cfg.prompt_version == "v2"
+
+
+def test_readme_troubleshooting_covers_first_run_problems():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    for needle in ("Key problems", "AQ.", "API key not valid", "Never pip-install Google libraries",
+                   "credential propagation was unsuccessful", "KeyboardInterrupt",
+                   "Disconnect and delete runtime", "Restart session", "Save in GitHub",
+                   "Run that edited cell", "Part 0", "$5.00"):
+        assert needle in text, needle
+    assert "$4.00" not in text and "Four Gemini models" not in text
+
+
+def test_cap_is_five_dollars_everywhere_marco_reads_it():
+    assert Config.load(CONFIG).spend_cap_usd == 5.00
+    for f in [ROOT / "README.md", ROOT / "notebooks" / "README.md", ROOT / "CLAUDE.md",
+              *NB.glob("*.ipynb")]:
+        text = f.read_text(encoding="utf-8")
+        assert "$4.00" not in text and "$4 cap" not in text, f.name

@@ -160,7 +160,8 @@ The run also exposed several operational failures (listed under "First-run fixes
 
 ## Budget
 
-About $1.21 has been spent of the $4.00 cap; the ledger is kept. Rough remaining costs:
+About $1.21 has been spent; the ledger is kept. **Marco raised the hard cap from $4.00 to $5.00
+(2026-10-27)** (`spend_cap_usd: 5.00`), leaving about $3.79. Rough remaining costs:
 
 | Step | Cost |
 |---|---|
@@ -170,8 +171,9 @@ About $1.21 has been spent of the $4.00 cap; the ledger is kept. Rough remaining
 | Self-consistency x2 (150 rows) | ~$0.5 |
 | Jev + summary judge | ~$0.15 |
 
-That totals about $2.4-2.7. It fits, but tightly. The existing phase-estimate gate stops cleanly if
-it would not fit. Raising `spend_cap_usd` is Marco's decision only; it is not changed here.
+That totals about $2.4-2.7, which fits under the $5.00 cap with about $1 to spare. The existing
+phase-estimate gate stops cleanly if it would not fit. Changing `spend_cap_usd` is Marco's decision
+only.
 
 ## Non-goals
 
