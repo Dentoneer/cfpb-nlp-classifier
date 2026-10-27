@@ -51,3 +51,21 @@ def test_cli_exits_nonzero_on_missing(tmp_path):
         cwd=ROOT, capture_output=True, text=True, check=False,
     )  # fmt: skip
     assert r.returncode == 1 and "nope_x" in r.stdout
+
+
+def test_aliases_are_shared_across_cells(tmp_path):
+    _nb(
+        tmp_path / "a.ipynb",
+        "from nlp import colab, pipeline as P\n",
+        "colab.setup\nP.STAGE_JEB\n",
+        "colab.no_such_helper\nP.NO_SUCH_STAGE\n",
+    )
+    problems = check_notebooks(tmp_path)
+    assert len(problems) == 2
+    assert all("cell 3" in p for p in problems)
+    assert any("no_such_helper" in p for p in problems)
+    r = subprocess.run(
+        [sys.executable, "-m", "nlp.tools.check_notebooks", str(tmp_path)],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert r.returncode == 1 and "NO_SUCH_STAGE" in r.stdout

@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -29,6 +30,11 @@ REPO_URL = "https://github.com/Dentoneer/cfpb-nlp-classifier"
 OVERRIDES_FILE = "config_overrides.json"
 LEVELS4 = ["product", "issue", "sub_issue", "path"]
 STAGE_FILTER_REPORT = "filter_report"
+ALLOWED_OVERRIDES = ("classifier_model", "judge_model", "batch_size", "thinking")
+MAX_MISSING_FRAC = 0.02  # stage_paid saves a stage missing at most this share of rows
+BUDGET_FLOOR_USD = 0.10  # less than this left under the cap counts as "budget reached"
+MEASURED_SAFETY = 1.5
+RESTART_MSG = "Restart session (Runtime menu \u2192 Restart session), then rerun this cell"
 
 
 class StageIncomplete(Exception):
@@ -38,22 +44,32 @@ class StageIncomplete(Exception):
 # --------------------------------------------------------------------------- config / setup
 
 
+def read_overrides(artifacts_dir: Path) -> dict:
+    """Saved config choices (only the allowed keys); unknown keys are an error."""
+    f = Path(artifacts_dir) / OVERRIDES_FILE
+    if not f.exists():
+        return {}
+    saved = json.loads(f.read_text(encoding="utf-8"))
+    bad = set(saved) - set(ALLOWED_OVERRIDES)
+    if bad:
+        raise ValueError(f"{f} has settings that cannot be overridden: {sorted(bad)}")
+    return saved
+
+
 def load_config(config_path: Path, artifacts_dir: Path) -> Config:
-    """Config from YAML with artifacts_dir replaced, then Marco's saved overrides applied."""
+    """Config from YAML with artifacts_dir replaced, then the saved choices applied."""
     cfg = dataclasses.replace(Config.load(Path(config_path)), artifacts_dir=Path(artifacts_dir))
     Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
-    f = Path(artifacts_dir) / OVERRIDES_FILE
-    if f.exists():
-        cfg = dataclasses.replace(cfg, **json.loads(f.read_text(encoding="utf-8")))
-    return cfg
+    return dataclasses.replace(cfg, **read_overrides(artifacts_dir))
 
 
 def save_overrides(cfg: Config, **changes) -> Config:
     """Persist config choices (e.g. the bake-off winner) on Drive; every notebook applies them."""
-    fields = {f.name for f in dataclasses.fields(Config)} - {"artifacts_dir", "prices"}
-    bad = set(changes) - fields
+    bad = set(changes) - set(ALLOWED_OVERRIDES)
     if bad:
-        raise ValueError(f"not a settable config field: {sorted(bad)}")
+        raise ValueError(
+            f"not an overridable setting: {sorted(bad)}; allowed: {list(ALLOWED_OVERRIDES)}"
+        )
     new = dataclasses.replace(cfg, **changes)
     for field in ("classifier_model", "judge_model"):
         if getattr(new, field) not in (cfg.prices or {}):
@@ -61,9 +77,54 @@ def save_overrides(cfg: Config, **changes) -> Config:
     if new.classifier_model == new.judge_model:
         raise ValueError("judge model must differ from the classifier model")
     f = Path(cfg.artifacts_dir) / OVERRIDES_FILE
-    old = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-    f.write_text(json.dumps({**old, **changes}, indent=2), encoding="utf-8")
+    merged = {**read_overrides(cfg.artifacts_dir), **changes}
+    f.write_text(json.dumps(merged, indent=2), encoding="utf-8")
     return new
+
+
+def apply_choices(cfg: Config, require_pick: bool = False, **choices) -> Config:
+    """Save only the choices that are set (not None) and differ from the current config.
+
+    With require_pick, a missing classifier_model is an error unless one was saved earlier.
+    """
+    if (
+        require_pick
+        and choices.get("classifier_model") is None
+        and "classifier_model" not in read_overrides(cfg.artifacts_dir)
+    ):
+        raise ValueError("Set PICK to your chosen model (e.g. 'gemini-2.5-flash') and rerun.")
+    changes = {k: v for k, v in choices.items() if v is not None and v != getattr(cfg, k, None)}
+    if changes:
+        cfg = save_overrides(cfg, **changes)
+    print(
+        f"classifier {cfg.classifier_model} | judge {cfg.judge_model} | "
+        f"batch_size {cfg.batch_size} | thinking {cfg.thinking}"
+    )
+    return cfg
+
+
+def _git_head(repo_dir: Path) -> str | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=20,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+_HEAD_AT_IMPORT = _git_head(Path(__file__).resolve().parent.parent)
+
+
+def needs_restart(head_at_import: str | None, head_now: str | None) -> bool:
+    """True if the repo moved (git pull) after nlp was imported: loaded modules are stale."""
+    return bool(head_at_import and head_now and head_at_import != head_now)
+
+
+def check_code_fresh(head_at_import: str | None, head_now: str | None) -> None:
+    if needs_restart(head_at_import, head_now):
+        raise RuntimeError(RESTART_MSG)
 
 
 def setup(
@@ -71,6 +132,7 @@ def setup(
     drive_subdir: str = "cfpb-nlp-classifier/phase1",
 ):
     """Mount Drive, load config, fetch the Gemini key, authorise Sheets -> (cfg, gc, api_key)."""
+    check_code_fresh(_HEAD_AT_IMPORT, _git_head(Path(repo_dir)))
     from google.colab import auth, drive, userdata
 
     drive.mount("/content/drive")
@@ -90,6 +152,7 @@ def setup(
     creds, _ = google.auth.default()
     gc = gspread.authorize(creds)
     print(f"Ready. Outputs go to {artifacts}")
+    print(f"Saved choices applied: {read_overrides(artifacts) or 'none yet'}")
     print(f"Classifier {cfg.classifier_model} | judge {cfg.judge_model} | cap ${cfg.spend_cap_usd:.2f}")
     return cfg, gc, api_key
 
@@ -110,9 +173,17 @@ def open_tools(cfg: Config) -> tuple[Ledger, JsonlCache, JsonlCache, RateLimiter
 
 
 def stage_paid(
-    cfg: Config, name: str, fn: Callable[[], pd.DataFrame], expected_ids: Iterable[str]
+    cfg: Config,
+    name: str,
+    fn: Callable[[], pd.DataFrame],
+    expected_ids: Iterable[str],
+    ledger: Ledger | None = None,
 ) -> pd.DataFrame:
-    """`store.stage` for Gemini steps: never saves a partial result.
+    """`store.stage` for Gemini steps: saves only a (nearly) complete result.
+
+    A shortfall caused by budget (under $0.10 left under the cap) or more than 2% of rows
+    missing is not saved - rerun later. Up to 2% missing for other reasons (rows Gemini
+    keeps answering invalidly) is saved and the missing ids are printed.
 
     Paid responses are already in the JSONL cache, so rerunning the cell later only pays for
     the rows still missing.
@@ -129,12 +200,21 @@ def stage_paid(
         ) from None
     except BudgetExceeded as e:
         raise StageIncomplete(f"Budget reached ({e}). Nothing more was spent.") from None
-    done = len(want & set(df["complaint_id"].astype(str))) if len(df) else 0
-    if done < len(want):
-        raise StageIncomplete(
-            f"{done} of {len(want)} complaints done for '{name}'. Either the budget cap was "
-            "reached (see the ledger line below) or some rows failed validation (see messages "
-            "above). Finished rows are saved; rerun this cell to retry the rest."
+    got = set(df["complaint_id"].astype(str)) if len(df) else set()
+    missing = sorted(want - got)
+    if missing:
+        frac = len(missing) / len(want)
+        budget_hit = ledger is not None and ledger.cap_usd - ledger.spent() < BUDGET_FLOOR_USD
+        if budget_hit or frac > MAX_MISSING_FRAC:
+            raise StageIncomplete(
+                f"{len(want) - len(missing)} of {len(want)} complaints done for '{name}'. "
+                "Either the budget cap was reached (see the ledger line below) or many rows "
+                "failed validation (see messages above). Finished rows are saved; rerun this "
+                "cell to retry the rest."
+            )
+        print(
+            f"{len(missing)} of {len(want)} complaints ({frac:.1%}) got no valid answer after "
+            f"retries and are left out of '{name}': {missing[:50]}"
         )
     store.write(cfg, name, df)
     return df
@@ -198,13 +278,57 @@ def estimate_classification(
     return runs * total
 
 
-def check_fits(ledger: Ledger, estimate_usd: float, label: str) -> None:
-    """Print the estimate against the remaining cap; raise StageIncomplete if it won't fit."""
+def measured_usd_per_request(ledger: Ledger, model: str) -> float | None:
+    """Mean real USD per request for `model` from the ledger file (None if none recorded)."""
+    if not ledger.path.exists():
+        return None
+    usd = []
+    with ledger.path.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+                if rec["model"] == model:
+                    usd.append(float(rec["usd"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+    return sum(usd) / len(usd) if usd else None
+
+
+def estimate_measured(
+    cfg: Config,
+    ledger: Ledger,
+    rows: pd.DataFrame,
+    *,
+    model: str | None = None,
+    batch_size: int | None = None,
+    runs: int = 1,
+) -> float | None:
+    """Realistic USD: measured $/request for the model x requests needed x 1.5 safety.
+
+    None when the ledger has no record for the model yet (use the reserve bound instead).
+    """
+    model = model or cfg.classifier_model
+    per = measured_usd_per_request(ledger, model)
+    if per is None:
+        return None
+    n_requests = math.ceil(len(rows) / (batch_size or cfg.batch_size))
+    return runs * n_requests * per * MEASURED_SAFETY
+
+
+def check_fits(
+    ledger: Ledger, estimate_usd: float, label: str, bound_usd: float | None = None
+) -> None:
+    """Print the estimate (and the worst-case bound) against the remaining cap.
+
+    Raises StageIncomplete if `estimate_usd` will not fit. The ledger still refuses any single
+    request that could cross the cap, whatever this says.
+    """
     left = ledger.cap_usd - ledger.spent()
-    print(f"{label}: estimated up to ${estimate_usd:.2f}; remaining cap ${left:.2f}")
+    extra = f" (worst-case bound ${bound_usd:.2f})" if bound_usd is not None else ""
+    print(f"{label}: estimated ${estimate_usd:.2f}{extra}; remaining cap ${left:.2f}")
     if estimate_usd > left:
         raise StageIncomplete(
-            f"{label} would need up to ${estimate_usd:.2f} but only ${left:.2f} of the "
+            f"{label} would need about ${estimate_usd:.2f} but only ${left:.2f} of the "
             f"${ledger.cap_usd:.2f} cap is left. Nothing was spent."
         )
 
@@ -338,31 +462,44 @@ def phase_estimate(
     test_df: pd.DataFrame,
     sc_rows: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Estimated $ per remaining paid step (judge steps use the classification estimate)."""
+    """Per remaining paid step: `bound_usd` (worst case) and `usd` (measured, <= bound)."""
     judge = cfg.judge_model
-    steps = [
-        (P.STAGE_PRED_GEMINI, "Test classification",
-         estimate_classification(cfg, test_df, taxonomy)),
-        (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2",
-         estimate_classification(cfg, sc_rows, taxonomy)),
-        (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3",
-         estimate_classification(cfg, sc_rows, taxonomy)),
-        (P.STAGE_JEB, "JEB judge, full test",
-         estimate_classification(cfg, test_df, taxonomy, model=judge)),
-        (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows",
-         estimate_classification(cfg, test_df.head(cfg.hand_check_n), taxonomy, model=judge)),
-    ]  # fmt: skip
-    df = pd.DataFrame(steps, columns=["stage", "step", "usd"])
-    df["done"] = [store.exists(cfg, st) for st in df["stage"]]
-    pend = float(df.loc[~df["done"], "usd"].sum())
-    print(df.assign(usd=df["usd"].map("${:.2f}".format)).to_string(index=False))
-    print(f"Still to spend (upper estimate): ${pend:.2f}; {ledger_report(ledger)}")
+    hc = test_df.head(cfg.hand_check_n)
+    spec = [  # (stage, label, rows, model)
+        (P.STAGE_PRED_GEMINI, "Test classification", test_df, cfg.classifier_model),
+        (P.STAGE_PRED_GEMINI_SC2, "Self-consistency run 2", sc_rows, cfg.classifier_model),
+        (P.STAGE_PRED_GEMINI_SC3, "Self-consistency run 3", sc_rows, cfg.classifier_model),
+        (P.STAGE_JEB, "JEB judge, full test", test_df, judge),
+        (P.STAGE_SUMMARY_JUDGE, "Summary judge, hand-check rows", hc, judge),
+    ]
+    out = []
+    for stage, label, rows, model in spec:
+        bound = estimate_classification(cfg, rows, taxonomy, model=model)
+        meas = estimate_measured(cfg, ledger, rows, model=model)
+        out.append(
+            (stage, label, bound, bound if meas is None else min(meas, bound),
+             meas is not None, store.exists(cfg, stage))
+        )  # fmt: skip
+    df = pd.DataFrame(out, columns=["stage", "step", "bound_usd", "usd", "measured", "done"])
+    show = df[["step", "bound_usd", "usd", "measured", "done"]].copy()
+    show["bound_usd"] = show["bound_usd"].map("${:.2f}".format)
+    show["usd"] = show["usd"].map("${:.2f}".format)
+    print(show.rename(columns={"usd": "estimate"}).to_string(index=False))
+    print(
+        f"Still to spend: estimate ${pending_usd(df):.2f} "
+        f"(worst-case bound ${pending_usd(df, column='bound_usd'):.2f}); {ledger_report(ledger)}"
+    )
     return df
 
 
-def pending_usd(est: pd.DataFrame, stages: Iterable[str]) -> float:
-    sel = est[est["stage"].isin(list(stages)) & ~est["done"]]
-    return float(sel["usd"].sum())
+def pending_usd(
+    est: pd.DataFrame, stages: Iterable[str] | None = None, column: str = "usd"
+) -> float:
+    """Sum of `column` over steps not yet done (optionally only the given stages)."""
+    sel = est[~est["done"]]
+    if stages is not None:
+        sel = sel[sel["stage"].isin(list(stages))]
+    return float(sel[column].sum())
 
 
 def load_human_review(cfg: Config, gc, url: str, allow_partial: bool = False) -> pd.DataFrame:

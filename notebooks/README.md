@@ -38,3 +38,9 @@ Google Drive: `MyDrive/cfpb-nlp-classifier/phase1/`
 
 `python -m nlp.tools.check_notebooks notebooks/` verifies every `nlp.*` name used in the code cells
 exists (runs in CI and in `tests/test_check_notebooks.py`).
+
+## Rerunning after a code change
+
+If the repo changes while a session is open (for example a new prompt version), the setup cell stops with
+"Restart session (Runtime menu → Restart session), then rerun this cell". Do that; saved results and
+choices on Drive are kept.

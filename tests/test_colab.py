@@ -140,9 +140,9 @@ def test_results_markdown_mentions_everything():
 
 def test_overrides_file_is_json(tmp_path):
     cfg = _cfg(tmp_path)
-    colab.save_overrides(cfg, prompt_version="v2")
+    colab.save_overrides(cfg, thinking="medium")
     data = json.loads((tmp_path / "config_overrides.json").read_text())
-    assert data == {"prompt_version": "v2"}
+    assert data == {"thinking": "medium"}
 
 
 # ---- notebook-step helpers -------------------------------------------------------------
@@ -267,3 +267,109 @@ def test_show_results_and_list_outputs(tmp_path):
     assert (tmp_path / "results.md").read_text(encoding="utf-8").startswith("## Phase 1 result")
     store.write(cfg, "x", pd.DataFrame({"a": [1]}))
     assert colab.list_outputs(cfg) == ["x.parquet"]
+
+
+# ---- fix round 1 ------------------------------------------------------------------------
+
+
+def test_overrides_restricted_to_four_settings(tmp_path):
+    cfg = _cfg(tmp_path)
+    for bad in ("prompt_version", "spend_cap_usd", "rpm", "seed"):
+        with pytest.raises(ValueError, match="not an overridable"):
+            colab.save_overrides(cfg, **{bad: 1})
+    (tmp_path / "config_overrides.json").write_text('{"spend_cap_usd": 99}', encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        colab.load_config(CONFIG, tmp_path)
+
+
+def test_apply_choices_is_rerun_safe(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    with pytest.raises(ValueError, match="PICK"):
+        colab.apply_choices(cfg, require_pick=True, classifier_model=None)
+    cfg = colab.apply_choices(cfg, require_pick=True, classifier_model="gemini-3.8-flash")
+    f = tmp_path / "config_overrides.json"
+    stamp = f.stat().st_mtime_ns
+    # rerun with None everywhere: keeps the saved pick, writes nothing
+    cfg2 = colab.load_config(CONFIG, tmp_path)
+    assert cfg2.classifier_model == "gemini-3.8-flash"
+    same = colab.apply_choices(cfg2, require_pick=True, classifier_model=None, batch_size=None)
+    assert same == cfg2 and f.stat().st_mtime_ns == stamp
+    # equal value: no write; different value: saved
+    colab.apply_choices(cfg2, classifier_model="gemini-3.8-flash", batch_size=cfg2.batch_size)
+    assert f.stat().st_mtime_ns == stamp
+    assert colab.apply_choices(cfg2, batch_size=25).batch_size == 25
+    assert colab.load_config(CONFIG, tmp_path).batch_size == 25
+    assert "classifier gemini-3.8-flash" in capsys.readouterr().out
+
+
+def test_stage_paid_tolerates_two_percent_but_not_budget(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    ids = [f"c{i}" for i in range(100)]
+    ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
+    one_short = pd.DataFrame({"complaint_id": ids[:99]})
+    two_short = pd.DataFrame({"complaint_id": ids[:98]})
+    three_short = pd.DataFrame({"complaint_id": ids[:97]})
+    # >2% missing: not saved
+    with pytest.raises(colab.StageIncomplete, match="97 of 100"):
+        colab.stage_paid(cfg, "a", lambda: three_short, ids, ledger)
+    assert not store.exists(cfg, "a")
+    # <=2% missing and budget fine: saved, ids printed
+    out = colab.stage_paid(cfg, "a", lambda: two_short, ids, ledger)
+    assert len(out) == 98 and store.exists(cfg, "a")
+    printed = capsys.readouterr().out
+    assert "c98" in printed and "c99" in printed and "2 of 100" in printed
+    # budget exhausted: even 1 missing row is not saved
+    ledger.record("gemini-2.5-flash", "r", 0, 1_600_000)  # $4.00 spent
+    with pytest.raises(colab.StageIncomplete, match="99 of 100"):
+        colab.stage_paid(cfg, "b", lambda: one_short, ids, ledger)
+    assert not store.exists(cfg, "b")
+
+
+def test_measured_estimate_from_ledger(tmp_path):
+    cfg = _cfg(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
+    rows = _tax_rows()  # 4 rows
+    assert colab.measured_usd_per_request(ledger, "gemini-2.5-flash") is None
+    assert colab.estimate_measured(cfg, ledger, rows) is None
+    ledger.record("gemini-2.5-flash", "a", 1_000_000, 0)  # $0.30
+    ledger.record("gemini-2.5-flash", "b", 3_000_000, 0)  # $0.90
+    ledger.record("gemini-3.1-flash-lite", "c", 1_000_000, 0)  # other model ignored
+    assert colab.measured_usd_per_request(ledger, "gemini-2.5-flash") == pytest.approx(0.60)
+    # 4 rows at batch 2 -> 2 requests x $0.60 x 1.5 safety, x2 runs
+    got = colab.estimate_measured(cfg, ledger, rows, batch_size=2, runs=2)
+    assert got == pytest.approx(2 * 2 * 0.60 * 1.5)
+
+
+def test_phase_estimate_uses_measured_when_available(tmp_path, capsys):
+    from nlp import pipeline as P
+
+    cfg = _cfg(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl", 4.0, cfg.prices)
+    rows = _tax_rows()
+    tax = build_taxonomy(rows)
+    before = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2))
+    assert not before["measured"].any()
+    assert (before["usd"] == before["bound_usd"]).all()
+    ledger.record(cfg.classifier_model, "a", 1000, 100)
+    after = colab.phase_estimate(cfg, ledger, tax, rows, rows.head(2)).set_index("stage")
+    assert after.loc[P.STAGE_PRED_GEMINI, "measured"]
+    assert after.loc[P.STAGE_PRED_GEMINI, "usd"] < after.loc[P.STAGE_PRED_GEMINI, "bound_usd"]
+    out = capsys.readouterr().out
+    assert "worst-case bound" in out
+
+
+def test_check_fits_prints_bound(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl", 1.0, cfg.prices)
+    colab.check_fits(ledger, 0.2, "x", bound_usd=0.9)
+    assert "worst-case bound $0.90" in capsys.readouterr().out
+
+
+def test_restart_detection_logic():
+    assert not colab.needs_restart("abc", "abc")
+    assert not colab.needs_restart(None, "abc")  # git unavailable: do not block
+    assert not colab.needs_restart("abc", None)
+    assert colab.needs_restart("abc", "def")
+    colab.check_code_fresh("abc", "abc")
+    with pytest.raises(RuntimeError, match="Restart session"):
+        colab.check_code_fresh("abc", "def")

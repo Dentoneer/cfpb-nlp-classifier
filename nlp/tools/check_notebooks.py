@@ -32,10 +32,8 @@ def _strip_magics(source: str) -> str:
     )
 
 
-def refs_in_source(source: str) -> set[tuple[str, str]]:
-    """(module-ish prefix, last name) pairs for every `nlp.` reference in `source`."""
-    tree = ast.parse(_strip_magics(source))
-    alias: dict[str, str] = {}
+def _imports(tree: ast.AST, alias: dict[str, str]) -> set[str]:
+    """Record nlp import aliases into `alias`; return the dotted names the imports reference."""
     dotted: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -51,6 +49,11 @@ def refs_in_source(source: str) -> set[tuple[str, str]]:
                     full = f"{mod}.{a.name}"
                     dotted.add(full)
                     alias[a.asname or a.name] = full
+    return dotted
+
+
+def _attribute_refs(tree: ast.AST, alias: dict[str, str]) -> set[str]:
+    dotted: set[str] = set()
     inner = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute) or id(node) in inner:
@@ -63,7 +66,28 @@ def refs_in_source(source: str) -> set[tuple[str, str]]:
         if isinstance(cur, ast.Name) and (cur.id in alias or cur.id == "nlp"):
             root = alias.get(cur.id, "nlp")
             dotted.add(".".join([root, *reversed(parts)]))
+    return dotted
+
+
+def _pairs(dotted: set[str]) -> set[tuple[str, str]]:
     return {tuple(d.rsplit(".", 1)) for d in dotted if "." in d}  # type: ignore[misc]
+
+
+def refs_in_sources(sources: list[str]) -> list[set[tuple[str, str]]]:
+    """Per-source reference sets, with import aliases shared across ALL sources (one notebook).
+
+    Imports are collected from every cell first, so `from nlp import colab` in cell 1 makes
+    `colab.x` in cell 7 checkable. Raises SyntaxError for a cell that does not parse.
+    """
+    trees = [ast.parse(_strip_magics(src)) for src in sources]
+    alias: dict[str, str] = {}
+    imported = [_imports(t, alias) for t in trees]
+    return [_pairs(imp | _attribute_refs(t, alias)) for imp, t in zip(imported, trees, strict=True)]
+
+
+def refs_in_source(source: str) -> set[tuple[str, str]]:
+    """(module-ish prefix, last name) pairs for every `nlp.` reference in one source."""
+    return refs_in_sources([source])[0]
 
 
 def resolve(dotted: str) -> str | None:
@@ -92,12 +116,16 @@ def check_notebooks(root: Path) -> list[str]:
     files = sorted(root.rglob("*.ipynb")) if root.is_dir() else [root]
     problems: list[str] = []
     for nb in files:
-        for n, src in enumerate(code_cells(nb), start=1):
+        cells = code_cells(nb)
+        parsed: dict[int, str] = {}
+        for n, src in enumerate(cells, start=1):
             try:
-                refs = refs_in_source(src)
+                ast.parse(_strip_magics(src))
+                parsed[n] = src
             except SyntaxError as e:
                 problems.append(f"{nb.name} code cell {n}: syntax error: {e.msg} (line {e.lineno})")
-                continue
+        numbers = list(parsed)
+        for n, refs in zip(numbers, refs_in_sources([parsed[k] for k in numbers]), strict=True):
             for mod, attr in sorted(refs):
                 why = resolve(f"{mod}.{attr}")
                 if why:
