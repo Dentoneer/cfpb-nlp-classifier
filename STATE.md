@@ -26,7 +26,13 @@ _Last updated: 2026-10-28_
   the credits are the real limit. `spend_cap_usd` -> 1000 (effectively off); credits-depleted
   (402/429 "prepayment credits are depleted") now -> `RequestRejected` with "add credit at
   aistudio.google.com/billing, rerun" instead of being retried as a rate limit. PR
-  `fix/remove-code-cap`. Next: Marco merges, reruns 03 setup + load + Part C (free) + Part D. CI now: `test` matrix (3.11, 3.13) +
+  #4 (merged). Credit balance $7.09 before Part D.
+  **Part C (200 tuning) v2 vs TF-IDF:** .855/.545/.315/.305 vs .835/.525/.390/.375.
+  **Part D v2 test (800): .853/.547/.375/.354** vs TF-IDF .810/.581/.482/.470 -> wins product only
+  (raw NO-GO unless hand review flips sub-issue). Descriptions did not help sub-issue vs v1.
+  04 done (spend $4.64 total). Review sheet:
+  https://docs.google.com/spreadsheets/d/1HATLTNurVLpYDA3VGZEzcsSRS2LwoFRxUUGlDtXJ-4A
+  Next: Marco's ~2h hand review, then 05. CI now: `test` matrix (3.11, 3.13) +
   `lint-and-test` gate job (name required by ruleset) — confirm on first PR run.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
@@ -65,7 +71,9 @@ _Last updated: 2026-10-28_
 - Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Finish v2 rerun: 03 Part D -> 04 (+2h hand review) -> 05. Limit = Google prepaid credits;
+- Finish v2 rerun: hand review -> 05 (go/no-go).
+- Likely v3 (if NO-GO): TF-IDF top-k shortlist (~5) -> Gemini picks among them (shorter, cheaper
+  prompt; combines CFPB labelling habits with Gemini reading). Examples per category after that. Limit = Google prepaid credits;
   Marco to report his remaining balance (aistudio.google.com/billing). Part C tuning table not yet seen.
 - Known, accepted limits: a timeout after Gemini already billed may under-count the ledger by
   ≤1 request; a 429 that persists through 5 retries surfaces as a raw `RateLimited` error;
