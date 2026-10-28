@@ -10,7 +10,7 @@ DEFAULT = Path(__file__).resolve().parent.parent / "config" / "phase1.yaml"
 
 def test_config_loads_default():
     cfg = Config.load(DEFAULT)
-    assert cfg.spend_cap_usd == 5.00 and cfg.judge_model != cfg.classifier_model
+    assert cfg.spend_cap_usd == 1000.00 and cfg.judge_model != cfg.classifier_model
     assert cfg.prices["gemini-3.8-flash"] == (0.75, 3.75)
     assert cfg.rpd is None and cfg.thinking == "low"
     assert cfg.likely_correct_threshold == 0.6
@@ -45,7 +45,7 @@ def test_config_rejects_bad_prices(tmp_path, extra, match):
 
 @pytest.mark.parametrize("cap", ["0", "-1", ".nan", ".inf"])
 def test_config_rejects_bad_cap(tmp_path, cap):
-    text = DEFAULT.read_text(encoding="utf-8").replace("spend_cap_usd: 5.00", f"spend_cap_usd: {cap}")
+    text = DEFAULT.read_text(encoding="utf-8").replace("spend_cap_usd: 1000.00", f"spend_cap_usd: {cap}")
     p = tmp_path / "c.yaml"
     p.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="spend_cap_usd"):

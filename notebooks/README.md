@@ -18,8 +18,8 @@ way; notebooks 00-03 run without it (setup just prints a note).
 | 05 | `05_results.ipynb` - ensembles, leaderboards, go/no-go | CPU | 5 min | $0 |
 
 Run them in order. After 04, **stop and fill in the review sheet** (link printed at the end of 04),
-then run 05. Total paid spend (Gemini + Jev) is capped at $5.00 in code (`spend_cap_usd`); every paid cell prints an
-estimate first and refuses to start if it will not fit in the remaining cap.
+then run 05. Total paid spend (Gemini + Jev) is limited by Google prepaid credits (the in-code `spend_cap_usd` is $1000, effectively off); every
+paid cell prints an estimate first.
 
 If a paid cell says the daily quota is exhausted, rerun that cell tomorrow; finished rows are cached.
 

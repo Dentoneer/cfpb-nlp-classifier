@@ -50,8 +50,8 @@ plan: `docs/superpowers/plans/2026-10-26-phase1-colab-nlp.md`. Run guide: `READM
   gate job. Colab ships google-genai 2.12.1: keep `google-genai>=2.12` satisfiable by it, and
   notebooks never pip-install Google libraries (only `.[ml]`; upgrading genai broke google-auth).
 - **Money path:** strictly sequential reserve → call → record in ledger → write cache. Ledger is
-  written before the cache so a crash never under-counts. Hard cap **$5.00** (`spend_cap_usd`,
-  raised from $4 by Marco on 2026-10-27),
+  written before the cache so a crash never under-counts. `spend_cap_usd` **$1000 = effectively off** (Marco, 2026-10-28:
+  Google prepaid credits are the real limit; credits-depleted 402/429 -> `RequestRejected`),
   covers Gemini and Jev (same ledger). Prices live in config, not code. Output price includes
   thinking tokens. Jev is input-only priced.
 - Gemini cache key = complaint_id|classifier_name|model|prompt_version, where the recorded
