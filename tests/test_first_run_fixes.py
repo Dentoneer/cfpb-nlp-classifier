@@ -117,6 +117,17 @@ def test_fix2_429_still_rate_limited():
         _genai_with(exc).generate("gemini-3.8-flash", "s", "u", RESPONSE_SCHEMA, "low", 10)
 
 
+@pytest.mark.parametrize("code", [402, 429])
+def test_prepaid_credits_depleted_is_plain_english_not_retried(code):
+    exc = _client_error(code, "RESOURCE_EXHAUSTED", "Your prepayment credits are depleted. "
+                        "Please go to AI Studio at https://ai.studio/projects to manage your "
+                        "project and billing.")  # fmt: skip
+    with pytest.raises(RequestRejected) as e:
+        _genai_with(exc).generate("gemini-3.8-flash", "s", "u", RESPONSE_SCHEMA, "low", 10)
+    assert "prepaid credits are used up" in str(e.value)
+    assert "rerun this cell" in str(e.value)
+
+
 def _tax():
     return build_taxonomy(pd.DataFrame({"product": ["P"], "issue": ["I"], "sub_issue": ["S"]}))
 
@@ -333,14 +344,15 @@ def test_readme_troubleshooting_covers_first_run_problems():
     for needle in ("Key problems", "AQ.", "API key not valid", "Never pip-install Google libraries",
                    "credential propagation was unsuccessful", "KeyboardInterrupt",
                    "Disconnect and delete runtime", "Restart session", "Save in GitHub",
-                   "Run that edited cell", "Part 0", "$5.00"):
+                   "Run that edited cell", "Part 0", "prepaid credits are used up"):
         assert needle in text, needle
     assert "$4.00" not in text and "Four Gemini models" not in text
 
 
-def test_cap_is_five_dollars_everywhere_marco_reads_it():
-    assert Config.load(CONFIG).spend_cap_usd == 5.00
+def test_cap_is_off_everywhere_marco_reads_it():
+    # Marco 2026-10-28: Google prepaid credits are the limit; the in-code cap is effectively off.
+    assert Config.load(CONFIG).spend_cap_usd == 1000.00
     for f in [ROOT / "README.md", ROOT / "notebooks" / "README.md", ROOT / "CLAUDE.md",
               *NB.glob("*.ipynb")]:
         text = f.read_text(encoding="utf-8")
-        assert "$4.00" not in text and "$4 cap" not in text, f.name
+        assert "$4.00" not in text and "$5.00 cap" not in text and "capped at $5" not in text, f.name

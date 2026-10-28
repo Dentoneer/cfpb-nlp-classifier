@@ -17,7 +17,7 @@ thinking: low
 embed_model: BAAI/bge-base-en-v1.5
 likely_correct_threshold: 0.6
 batch_size: 10
-spend_cap_usd: 5.00  # hard cap for all paid calls (Gemini + Jev); raised from $4.00 by Marco 2026-10-27
+spend_cap_usd: 1000.00  # effectively off (Marco, 2026-10-28): Google prepaid credits are the real limit
 rpm: 60
 rpd: null
 # USD per 1M tokens: [input, output]

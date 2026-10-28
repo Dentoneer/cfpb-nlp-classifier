@@ -75,6 +75,16 @@ class FakeClient:
 MAX_OUTPUT_TOKENS = 65536  # output limit of every Gemini model we use; never ask for more
 
 KEY_HELP = "Gemini rejected the API key. See README 'Key problems'."
+CREDITS_HELP = (
+    "Your Google prepaid credits are used up. Add credit on the AI Studio Billing page "
+    "(https://aistudio.google.com/billing), then rerun this cell - finished rows are saved."
+)
+
+
+def credits_depleted(e) -> bool:
+    """True if Google says the prepaid balance is empty (sent as HTTP 402 or 429)."""
+    text = f"{getattr(e, 'message', '')} {getattr(e, 'details', '')}".lower()
+    return "prepayment credits" in text or "credits are depleted" in text
 
 
 def explain_rejection(e, model: str | None = None, thinking: str | None = None) -> str:
@@ -82,6 +92,8 @@ def explain_rejection(e, model: str | None = None, thinking: str | None = None) 
     code = getattr(e, "code", None)
     message = str(getattr(e, "message", None) or e)
     text = f"{message} {getattr(e, 'status', '')} {getattr(e, 'details', '')}".lower()
+    if credits_depleted(e):
+        return CREDITS_HELP
     if code == 404 or "no longer available" in text:
         return (
             f"Gemini model '{model}' is retired or unknown (Google says: {message[:160]}): model "
@@ -146,7 +158,7 @@ class GenAIClient:
         try:
             resp = self._client.models.generate_content(model=model, contents=user, config=cfg)
         except errors.ClientError as e:
-            if e.code == 429:
+            if e.code == 429 and not credits_depleted(e):
                 raise self._rate_limited(e) from e
             raise RequestRejected(e.code, explain_rejection(e, model, thinking)) from e
         except errors.ServerError as e:  # 5xx, e.g. 503 "model is overloaded": not billed

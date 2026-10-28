@@ -1,6 +1,6 @@
 # STATE
 
-_Last updated: 2026-10-27_
+_Last updated: 2026-10-28_
 
 ## Current status
 - **Phase 1 v1 merged** (PR #2) and **run live once (2026-10-27)**. Notebooks 00-03 Part D done.
@@ -16,8 +16,17 @@ _Last updated: 2026-10-27_
   and fixes for every first-run failure. Implemented (commits 8b5d193..fa4bfb2, 292 tests, verified
   on Python 3.13 + google-genai 2.12.1). **Spend cap raised to $5.00 (Marco, 2026-10-27).** Independent
   review: "ready with fixes" (v2-only cost projection — test likely ~$2 not $1.2-1.5; Part C
-  compares v2 vs TF-IDF on tuning; don't overwrite Sheet edits; + 8 minors). All fixed in `5bd70f8` (312 tests). **PR #3 open, CI green** (3.11 + 3.13 + `lint-and-test` gate);
-  waiting on Marco's merge; then Marco merges, reruns 00->05. CI now: `test` matrix (3.11, 3.13) +
+  compares v2 vs TF-IDF on tuning; don't overwrite Sheet edits; + 8 minors). All fixed in `5bd70f8` (312 tests). **PR #3 merged 2026-10-27** (117e2f8); Marco is rerunning 00->05. **v2 rerun progress:** 00 ok ($1.20 spent);
+  01 = 319,016 complaints, 231 paths, window 2025-06..2026-06 (no_sub_issue removed 27,729);
+  02 v2 baselines (test) product/issue/sub_issue/path: TF-IDF .810/.581/.482/.470, embed_lr
+  .842/.558/.430/.421, kNN .821/.516/.409/.402, ModernBERT .861/.576/.466/.461.
+  03 Parts 0, A, B, C all run (A/B re-run on v2 by mistake, ~+$0.5); spend $2.52. Part D estimate
+  said $3.72 (x1.5 safety; ~$2.60 real) vs $2.48 left -> stopped by the code cap, nothing spent.
+  **Marco 2026-10-28: remove the code cap** - he uses Google *prepaid credits* (no budget alert), so
+  the credits are the real limit. `spend_cap_usd` -> 1000 (effectively off); credits-depleted
+  (402/429 "prepayment credits are depleted") now -> `RequestRejected` with "add credit at
+  aistudio.google.com/billing, rerun" instead of being retried as a rate limit. PR
+  `fix/remove-code-cap`. Next: Marco merges, reruns 03 setup + load + Part C (free) + Part D. CI now: `test` matrix (3.11, 3.13) +
   `lint-and-test` gate job (name required by ruleset) — confirm on first PR run.
 - Repo is public: https://github.com/Dentoneer/cfpb-nlp-classifier (public because rulesets need
   GitHub Pro on private repos). Ruleset `protect-main` (id 25913186): PR + 1 approval + the
@@ -56,8 +65,8 @@ _Last updated: 2026-10-27_
 - Workflow: one feature branch, commit per task, one PR at the end.
 
 ## Open threads / next steps
-- Finish v2: review -> PR -> Marco merges -> rerun 00->05 (revised estimate $3-4 needed vs ~$3.79 left under the $5 cap; Part C prints a projection —
-  batch size 25 is the lever if it won't fit). Marco to raise the Google budget alert to ~$6.
+- Finish v2 rerun: 03 Part D -> 04 (+2h hand review) -> 05. Limit = Google prepaid credits;
+  Marco to report his remaining balance (aistudio.google.com/billing). Part C tuning table not yet seen.
 - Known, accepted limits: a timeout after Gemini already billed may under-count the ledger by
   ≤1 request; a 429 that persists through 5 retries surfaces as a raw `RateLimited` error;
   peak memory of notebook 01 on the full mirror is unmeasured (DuckDB spills to

@@ -10,7 +10,7 @@ well they catch classification mistakes.
 
 1. **Phase 1 — Colab experiment (code complete, ready to run).** Prove the NLP on a small stratified sample,
    produce a classifier leaderboard and a validator leaderboard, and make a go/no-go call
-   (≥85% adjusted accuracy at the Product level). Gemini spend is capped at $5 in code.
+   (≥85% adjusted accuracy at the Product level). Gemini spend is limited by Google prepaid credits (the in-code cap is off).
 2. **Phase 2 — Production.** The same `nlp/` code packaged as a Docker image and run on
    Google Cloud Run Jobs, with BigQuery tables, dbt models + tests, and an Airflow DAG that
    classifies newly arriving complaints incrementally. Designed after the Phase 1 go/no-go.
@@ -39,24 +39,26 @@ catch Gemini's mistakes, and a clear **go / no-go** answer (is Gemini accurate e
 on the Product level, to build the real thing?).
 
 **Total time:** about 4-6 hours spread over a few sittings, including about 2 hours of hand review.
-**Total cost (estimate):** roughly $3-4 still to spend on top of the ~$1.21 the first run used, so
-close to the $5.00 hard cap. The new prompt is 2-3 times longer than the first run's (it carries a
+**Total cost (estimate):** roughly $3-4 still to spend on top of the ~$1.21 the first run used.
+Google prepaid credits are the spending limit (Marco, 2026-10-28; the in-code cap is set to $1000,
+effectively off). The new prompt is 2-3 times longer than the first run's (it carries a
 description of every category), so these are estimates, not promises: every paid cell prints its own
-estimate first, Part C prints a projection for the rest from its real cost, and the code refuses to
-spend past $5.00 (nothing is wasted if it stops).
+estimate first, Part C prints a projection for the rest from its real cost, and when the prepaid credits run out the
+cell stops with "Your Google prepaid credits are used up" (nothing is wasted: add credit and rerun).
 
 > The notebooks download the code from the `main` branch on GitHub. Make sure the Phase 1 pull
 > request has been merged before you start.
 
-**Only one person and one notebook should spend money at a time.** The $5.00 cap is tracked in a
+**Only one person and one notebook should spend money at a time.** Spend is tracked in a
 ledger file on Drive, so two notebooks running paid cells at once could both see the same money left.
 
 ### Before you start (one time, about 30 minutes)
 
 1. **Google Cloud project for Gemini.** Marco creates a project (for example
    `cfpb-nlp-classifier`) at [console.cloud.google.com](https://console.cloud.google.com), turns
-   on billing, and sets a **$5 budget alert** (Billing > Budgets & alerts). Google's alert only
-   emails you; it does not stop spending. The real stop is the $5.00 cap in our code.
+   on billing with **prepaid credits** (check the balance at
+   [aistudio.google.com/billing](https://aistudio.google.com/billing)). When the credits run out,
+   Google stops answering; that is the spending limit (the in-code cap is effectively off).
 2. **Gemini API key.** At [aistudio.google.com/apikey](https://aistudio.google.com/apikey) create a
    key in that project. (The free tier is too slow for this job, so billing must be on.)
 3. **Jev API key.** Jev is a small AI checker from TypeSafe AI that answers yes/no questions about
@@ -158,7 +160,8 @@ decision. Free, a few minutes.
 
 ### What to do if a notebook stops
 
-- **"Budget reached ..." or "would need about $X but only $Y of the $5.00 cap is left".** Stop. The $5.00 cap did its job. Nothing is lost.
+- **"Your Google prepaid credits are used up".** Add credit at [aistudio.google.com/billing](https://aistudio.google.com/billing), then rerun the same cell. Finished rows are saved; nothing is lost.
+- **"Budget reached ..." or "would need about $X but only $Y of the cap is left".** Stop. The in-code cap (now $1000, effectively off) did its job. Nothing is lost.
   Tell Claude what the ledger says; do not try to get around it.
 - **"daily request quota is used up" (or "daily Gemini request quota is used up").** Google limits how many requests you can send per day. Rerun the same
   cell tomorrow. Finished rows are cached, so you do not pay again.
@@ -223,7 +226,7 @@ Google Drive: `MyDrive/cfpb-nlp-classifier/phase1/`
 
 - `results.md` - the final summary (start here)
 - `*.parquet` - every table, including the two leaderboards and adjusted accuracy
-- `ledger.jsonl` - every paid charge; this is how the $5.00 cap is enforced
+- `ledger.jsonl` - every paid charge; this is how spend is counted
 - `gemini_cache.jsonl`, `judge_cache.jsonl` - saved answers, so reruns are free
 - `models/` and `config_overrides.json` - trained models and your bake-off choices
 - `taxonomy_url.txt`, `review_sheet_url.txt` - the Google Sheet links
